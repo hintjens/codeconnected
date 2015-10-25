@@ -1,0 +1,171 @@
+In this article I'll descibe a popular way of making really awful protocols, using "RPC" or Remote Procedure Calls. My goal is to teach you to never use RPC, ever again. As a safer and saner alternative I'll explain how to do RESTful work over ZeroMQ.
+
+++ What's the Problem?
+
+The other day a friend asked me what the limit was on zproto's command numbering. My spidey sense immediately flashed, "Danger!" When someone asks "is it normal that the cat makes that strange noise?" the prudent person asks, "what precisely are you doing to the poor animal?" So it also goes for protocol tools like zproto.
+
+Let me start by saying, if your protocol has even dozens, let alone hundreds, of commands, then you are Doing it Wrong. What "wrong" means is that you'll end up spending more time and money than you need to. Not in a good way either. While buying a nice, //really good// pair of shoes can be cathartic, there is nothing healing about telling your boss, "sorry, we can't make that essential change because it would break everything."
+
+We sometimes mix the concepts of "API" and "protocol". I've done this myself, designing protocols that looked like APIs, and designing APIs that act like protocols. However it's like putting ginger in a curry. The art is to add spice without breaking the taste of the dish.
+
+There are good APIs and there are poor APIs. A good API at least organizes itself into silos, which we can call "packages" or "classes". The poorly-designed API is typically one large bundle of loosely related methods. However, both map to nasty, fragile protocols.
+
+Let me show with an example. AMQP (my favorite example of smart people making stupid mistakes) had server-side objects like "exchange" and "binding". So the API-protocol fudge had methods like "exchange.declare" and "binding.delete". On the plus side, the protocol was neatly organized into silos, and was easy to use as an API.
+
+On the minus side, it was fragile as heck. The prime directive of every protocol should be "Interoperate!", and AMQP could not even interoperate with itself. AMQP/0.9.1 did not talk to AMQP/0.8. Let's not mention the alien invader that is currently wearing AMQP's face in public.
+
+APIs have some endearing properties:
+
+* They change often, because they are mapped closely to business language that is constantly evolving.
+* When you use the wrong version, they tend to crash.
+
+True, some platforms have managed to keep compatibility over decades. Windows and Linux, for instance. There can be a lot of pain involved.
+
+More usually, though, when we turn an API with hundreds of methods into a protocol, we create a monster. If the monster dies rapidly, fine. If the monster lives and grows, that means real trouble ahead.
+
+In a distributed system, it is //essential// to be able to evolve pieces independently. This also means evolving the business semantics independently across different parts of the system. Once you cast these semantics into protocols, that becomes approximately impossible.
+
+With AMQP we could evolve the protocol for a few years because (a) it was not a real distributed system, all clients talking to central brokers, and (b) we could make brokers like OpenAMQ and RabbitMQ talk several versions of the protocol. Even then, the cost of change was so insanely high that we simply froze the protocol, and then it died (perhaps from frostbite).
+
+++ Hell is Large Contracts
+
+Beware of large integrated contracts. Do you really want your electricity, Internet, coffee, and cat food from a single supplier, on one contract? There's a reason monopolists and cartels love "bundling" and consumers hate them. It raises the switching costs ("I have a better catfood supplier") and so lets the supplier raise costs overall.
+
+What we want are small, focussed contracts with the right level of abstraction. Heck, we don't even need very good contracts at the start. If switching costs are low to zero, we can improve individual contracts cheaply over time.
+
+Back to AMQP as example. The protocol raised server objects like "exchange", "binding", "queue", and "consumer" to first class entities. Adding, removing, or changing these had the effect of changing the whole contract. Making a single tweak to any of these broke interoperabilty for everything.
+
+This is what you get when you map an API (even one that's neatly designed) to a network protocol. A large, fragile contract that punishes experimentation and evolution, and creates pseudo-distributed systems you cannot improve gradually over time.
+
+++ The Resource Abstraction
+
+The answer I'm going to present -- it's not the only one, yet it's a good one -- is old and surprisingly boring. That is, instead of presenting your business objects as a set of objects with arbitrary methods and properties, use abstract resources.
+
+With abstract resources we need only four methods: create, fetch, update, and delete. A resource is then a document (using a self-describing format like XML or JSON). Resources can be nested. Instead of executing methods on objects, we modify properties on a resource.
+
+The best known design for this is REST, based on HTTP. It uses POST, GET, PUT, and DELETE for method names, and a host of headers like "If-Modified-Since" to condition how these work. RESTful APIs (so-called) are in fact decent protocols. Take a look [http://developer.openstack.org/api-ref-compute-v2.html at the OpenStack Compute API]. You can see that there are dozens of distinct contracts. Requests and responses are both extensible by design.
+
+++ Mapping REST to ZeroMQ
+
+We can design a generic RESTful access protocol and map it to ZeroMQ. We did the foundation work some years ago [http://www.restms.org/spec:1 for RestMS]. I don't think many people picked that up at the time. However today it looks quite useful for ZeroMQ applications struggling with how to design their protocols.
+
+Our generic use case is a server that holds a set of resources belonging to, and managed by, a set of remote clients. We wish to build APIs, based on network protocols that allow clients and servers to be distributed across both local and wide area networks. We hold that such protocols are essential for the clean separation of components of a distributed architecture.
+
+Protocols define agreed and testable contracts. Our resource access protocol has two levels of contract:
+
+* Agreement on the resources that the server provides; the names and properties, and semantics of such resources; and their relationship to one another. This consists of any number of independent "resource schemas".
+
+* Agreement on how to represent resources on the wire, how to navigate the resource schema, create new resources, retrieve resources, return errors, and so on. This is the "access protocol", which XRAP provides.
+
+The main goal of XRAP is to make it extremely cheap to develop, test, improve, and discard resource schemas. That is, to allow specialists in this domain to develop good schemas with minimal marginal cost. XRAP achieves this economy is by splitting off, and independently solving the access protocol.
+
+* In technical terms, it allows the provision of 100% reusable solutions (libraries and internal APIs in arbitrary languages) for the access and transport layers.
+
+* In specification terms, it allows the formal specification of schemas as small independent RFCs.
+
+Here is the XRAP encoding over ZeroMQ:
+
+[[code]]
+xrap_msg        = *( POST | POST-OK
+                   | GET | GET-OK | GET-EMPTY
+                   | PUT | PUT-OK
+                   | DELETE | DELETE-OK
+                   | ERROR )
+
+;  Create a new, dynamically named resource in some parent.
+
+POST            = signature %d1 parent content_type content_body
+signature       = %xAA %xA5             ; two octets
+parent          = string                ; Schema/type/name
+content_type    = string                ; Content type
+content_body    = longstr               ; New resource specification
+
+;  Success response for POST.
+
+POST-OK         = signature %d2 status_code location etag date_modified
+                  content_type content_body
+status_code     = number-2              ; Response status code 2xx
+location        = string                ; Schema/type/name
+etag            = string                ; Opaque hash tag
+date_modified   = number-8              ; Date and time modified
+content_type    = string                ; Content type
+content_body    = longstr               ; Resource contents
+
+;  Retrieve a known resource.
+
+GET             = signature %d3 resource if_modified_since if_none_match
+                  content_type
+resource        = string                ; Schema/type/name
+if_modified_since = number-8            ; GET if more recent
+if_none_match   = string                ; GET if changed
+content_type    = string                ; Desired content type
+
+;  Success response for GET.
+
+GET-OK          = signature %d4 status_code content_type content_body
+status_code     = number-2              ; Response status code 2xx
+content_type    = string                ; Actual content type
+content_body    = longstr               ; Resource specification
+
+;  Conditional GET returned 304 Not Modified.
+
+GET-EMPTY       = signature %d5 status_code
+status_code     = number-2              ; Response status code 3xx
+
+;  Update a known resource.
+
+PUT             = signature %d6 resource if_unmodified_since if_match
+                  content_type content_body
+resource        = string                ; Schema/type/name
+if_unmodified_since = number-8          ; Update if same date
+if_match        = string                ; Update if same ETag
+content_type    = string                ; Content type
+content_body    = longstr               ; New resource specification
+
+;  Success response for PUT.
+
+PUT-OK          = signature %d7 status_code location etag date_modified
+status_code     = number-2              ; Response status code 2xx
+location        = string                ; Schema/type/name
+etag            = string                ; Opaque hash tag
+date_modified   = number-8              ; Date and time modified
+
+;  Remove a known resource.
+
+DELETE          = signature %d8 resource if_unmodified_since if_match
+resource        = string                ; schema/type/name
+if_unmodified_since = number-8          ; DELETE if same date
+if_match        = string                ; DELETE if same ETag
+
+;  Success response for DELETE.
+
+DELETE-OK       = signature %d9 status_code
+status_code     = number-2              ; Response status code 2xx
+
+;  Error response for any request.
+
+ERROR           = signature %d10 status_code status_text
+status_code     = number-2              ; Response status code, 4xx or 5xx
+status_text     = string                ; Response status text
+
+; Strings are always length + text contents
+string          = number-1 *VCHAR
+longstr         = number-4 *VCHAR
+
+; Numbers are unsigned integers in network byte order
+number-1        = 1OCTET
+number-2        = 2OCTET
+number-4        = 4OCTET
+number-8        = 8OCTET
+[[/code]]
+
+I've written this up as [http://rfc.zeromq.org/spec:40 a draft on the ZeroMQ RFC website]. There is [https://github.com/zeromq/rfc/blob/master/src/spec_40.xml a zproto model] for the protocol if you want to experiment.
+
+++ Conclusions
+
+While it's become easy to build RPC protocols using tools like protobufs and zproto, many of these protocols tend to be fragile and expensive to evolve across a distributed system. That becomes a problem at scale. The root cause is the lack of abstraction, so that every change to business semantics causes a break in the protocol, and a new version.
+
+One proven way to address this is to use a RESTful resource approach, instead of RPC. This provides equivalent semantics, yet is designed to handle change naturally, and cheaply.
+
+In this article I've presented a new protocol called XRAP, which provides a RESTful approach over ZeroMQ. XRAP is still a draft specification and under development. If you want to use it, contact me and we'll work together on this.
+

@@ -1,0 +1,159 @@
+The New TIPC Transport in ZeroMQ
+
+ZeroMQ now supports TIPC, the cluster IPC protocol developed by Ericsson. This will be part of the next major 4.1 release. In this article I'll interview Ericsson's Erik Hugne, the engineer who added this transport to ZeroMQ.
+
+Though ZeroMQ is great in many ways, it isn't easy to plug in different transports. So when we see a new transport like this, it's a sign of world class software engineering. I asked Erik a few questions, to learn more about TIPC, and why Ericsson added this to ZeroMQ.
+
+//Pieter: First off, what's TIPC?//
+
+Erik: TIPC is a cluster IPC protocol developed by Ericsson, it was initially a proprietary closed source solution, but both the specification and source code was released on Sourceforge early 2000, and picked up by the Linux kernel from v2.6.16.
+
+//How does TIPC compare, for example, to TCP?//
+
+TIPC provides a socket based API, supporting SOCK_STREAM, SOCK_RDM and SOCK_SEQPACKET. The ZeroMQ TIPC transport currently supports connection-oriented stream transmission (SOCK_STREAM), so the behaviour and characteristics of this are similar to that of TCP.
+
+Each node in a cluster establish logical links to its peers. These links are supervised actively with seamless failover to redundant links.
+
+TIPC guarantees in-order, sequential delivery on the link-level, even for connectionless (SOCK_RDM) and multicast traffic, given that the serving application is capable of keeping up with the load (we have no flow control for connectionless traffic).
+
+It comes with a distributed topology service that keeps track of all published services (bound sockets) in the cluster.
+
+Finally, TIPC can run over Ethernet and/or Infiniband.
+
+//This sounds... extremely powerful. This means we can create clusters in just a few lines of code, using all the ZeroMQ patterns. I see you made a whole set of test cases for TIPC. Request-reply, pub-sub, the whole lot. Can you explain briefly how to use TIPC then?//
+
+Sure. To use the TIPC transport, the serving ZeroMQ application needs to bind to a TIPC name sequence, a 3-tuple {type, lower, upper}. The 'type' is an ID that uniquely identifies your service in the cluster. The 'lower' and 'upper' are a service partitioning range that can be used for basic load balancing purposes. For example:
+
+[[code]]
+zmq_bind (sb, "tipc://{5560,0,100}");
+[[/code]]
+
+And then for the client application to be able to connect, it specifies an ID in the range we defined above, for example:
+
+[[code]]
+zmq_connect (sc, "tipc://{5560,30}");
+[[/code]]
+
+//This is a Linux-only transport, which is fine for most people. How do I install TIPC?//
+
+If you want to try it out, a Linux machine with kernel >= 3.8 with {{CONFIG_TIPC=m}} is required.
+
+//I'm going to have to play with this at some time and see how it handles failures.//
+
+I'd like to emphasize here that you won't see a performance boost by switching to TIPC. There is no support for GRO (Generic Receive offload) yet, and the kernel code is not as mature as that of TCP/IP. In my opinion this starts to get really useful in a cluster environment once we have the RDM/Multicast support in place.
+
+//Right, so the TIPC transport in ZeroMQ is about reliability, not performance.//
+
+Yes, failover and load-balancing. You can do these on top of ZeroMQ, but when we can delegate it to TIPC, the results are better and it's invisible to the programmer. I'll embed it in a simple example using two qemu nodes, and simulating a failure on the primary link. This have almost the same effect as if a switch/port/cable fails.
+
+First, I need to assign node addresses, worth noting is that TIPC does not use per-interface addresses, but rather a node-global one.
+
+[[code]]
+Node1# tipc-config -a=1.1.1
+[...] tipc: Started in network mode
+[...] tipc: Own node address <1.1.1>, network identity 4711
+[[/code]]
+
+I do the same thing on the second node, with the address "1.1.2". Then, I tell TIPC to use Ethernet interfaces 'vlan100' and 'vlan200'
+(Same thing done on the second node):
+
+[[code]]
+Node2# tipc-config -be=eth:vlan100
+[...] tipc: Enabled bearer <eth:vlan100>, discovery domain <1.1.0>, priority 10
+[...] tipc: Established link <1.1.2:vlan100-1.1.1:vlan100> on network plane A
+
+Node2# tipc-config -be=eth:vlan200
+[...] tipc: Enabled bearer <eth:vlan200>, discovery domain <1.1.0>, priority 10
+[...] tipc: Established link <1.1.2:vlan200-1.1.1:vlan200> on network plane B
+[[/code]]
+
+Now we start a netperf session from Node1 to Node2:
+
+[[code]]
+Node1# netperf -H Node2 -t TIPC_STREAM -l 100
+# /opt/netperf/netperf -H 192.168.1.78 -t TIPC_STREAM -l 100
+TIPC STREAM TEST to <1.1.2:3310419987>
+[test running]
+[[/code]]
+
+Here is how we check the link statistics on Node2 to see which link is currently the primary one:
+
+[[code]]
+Link <1.1.2:vlan100-1.1.1:vlan100>
+  ACTIVE  MTU:1500  Priority:10  Tolerance:1500 ms  Window:50 packets
+  RX packets:298078 fragments:0/0 bundles:0/0
+  [...]
+
+Link <1.1.2:vlan200-1.1.1:vlan200>
+  ACTIVE  MTU:1500  Priority:10  Tolerance:1500 ms  Window:50 packets
+  RX packets:0 fragments:0/0 bundles:0/0
+  [...]
+[[/code]]
+
+Th top one is primary (see the RX packets), so let's bring that device down, simulating a crash:
+
+[[code]]
+Node2# ip link set vlan100 down
+[...] tipc: Blocking bearer <eth:vlan100>
+[...] tipc: Lost link <1.1.2:vlan100-1.1.1:vlan100> on network plane A
+[[/code]]
+
+Node1 reacts to this immediately and does a changeover to link 2:
+
+[[code]]
+[...] tipc: Resetting link <1.1.1:vlan100-1.1.2:vlan100>, changeover initiated by peer
+[...] tipc: Lost link <1.1.1:vlan100-1.1.2:vlan100> on network plane A
+[[/code]]
+
+Despite the failure and recovery, our transmission continues happily, unacked messages that were already sent out on the failed link will be retransmitted on the new primary one after the changeover:
+
+[[code]]
+Recv   Send    Send
+Socket Socket  Message  Elapsed
+Size   Size    Size     Time     Throughput
+bytes  bytes   bytes    secs.    10^6bits/sec
+
+34120200 212992 212992    100.00    648.45
+[[/code]]
+
+Regarding load balancing, I'll write a demo application for that soon. In the meantime, here's an example in pseudocode that will help you to understand the concept.
+
+The same service is published on both node1 and node2, using partially overlapping names:
+
+[[code]]
+Node1:
+[...]
+zmq_bind (sd, "tipc://{1000,0,1}
+[...]
+
+Node2:
+[...]
+zmq_bind (sd "tipc://{1000,1,2}
+[...]
+[[/node]]
+
+Now, a client on Node3 wanting to use this service can do so by connecting to either:
+
+[[code]]
+A = zmq_connect (sc, "tipc://{1000,0}")
+B = zmq_connect (sc, "tipc://{1000,1}")
+C = zmq_connect (sc, "tipc://{1000,2}")
+[[/code]]
+
+Load balancing works this way:
+
+* A only matches the service published by Node1.
+* C only matches the service published by Node2.
+* B matches both Node1 and Node2. TIPC will do round-robin selection between these two, spreading out the connections evenly.
+
+There's still a missing feature in the code that's on libzmq master right now. By default, TIPC sets the "lookup domain" to closest first. This means that if there is a published service on the local machine that matches your request, that will be used for //all// requests, even when you spread your service over multiple nodes.
+
+So, either I will add a way for the application to specify the lookup domain in the connect string, or I'll set the default lookup domain to always do round-robin over the entire cluster.
+
+The [http://tipc.sourceforge.net/doc/tipc_2.0_prog_guide.html#using_port_names TIPC 2.0 Programmer's Guide] explains a little about how name sequences work.
+
+//Thank you so much, Erik, for this excellent addition to ZeroMQ, and your explanations. What are your plans for TIPC support in future versions of ZeroMQ?//
+
+Looking forward, we'd like to extend this with a RDM multicast transport module as well, which will make it very fast. This would add the ability to reliably send a series of messages to 0..n recipients. We are also investigating how to expose the topology service to ZeroMQ applications in a portable way.
+
+//I'm looking forward to this. Incidentally, the TIPC transport will appear in ZeroMQ v4.1//

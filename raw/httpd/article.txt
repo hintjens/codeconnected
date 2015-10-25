@@ -1,0 +1,93 @@
+There are developers who never built distributed systems. Then there are developers who have done this before, using a messaging system. Then there are those who've done it the hard way, using BSD sockets. Privately, I call these the Good, the Bad, and the Ugly, because of how they respond when they meet 0MQ and read the Guide. Today, "Getting Started with ZeroMQ for Uglies". With a "Hello, World" web server in --40-- 30 lines of C, just for fun.
+
+++ The Good, the Bad, and the Ugly
+
+First, a confession: I'm an Ugly, writing my first distributed fabric in 1990. This was for a pan-European tour operator app, running on Digital ACMS, and it ran for 20 years. It was quite a shock to see formal messaging systems when we started building AMQP for JPMorganChase around 2004. I've come to appreciate the abstractions but it took a long time.
+
+The Good, when they see 0MQ, don't come with preconceptions. They open a magic box, learn the different tools, and for the most part, experience the kind of euphoric empowerment we dream of when we make software for other people to use. The Good are the people I cherish the most, because their lack of previous experience keeps them open to doing the most exciting, aka crazy, things with 0MQ. They also often come from a generation that's used to GitHub, which enjoys making pull requests, and so on.
+
+The Bad, when they see 0MQ, immediately try to fit it into their view of How Things Work. I've called this the "Fire vs. Electricity" paradox. When you're used to Fire, and you enjoy your grilled mammoth burger, it's kind of freaky to hear someone explaining electricity. The more experience you have with Fire, the more you will dislike this new form of energy. When someone explains, "Sure, you can make a grill, but you can also power your smartphone," the inclination is to hit the speaker over the head with the chewed-up remnants of a mammoth rib bone. The Bad tend to come to the zeromq-dev mailing list with long and unanswerable questions of the form, "How do I use 0MQ to do such-and-such?" which is like asking, "how do I use this thing you call 'electricity' to set fire to the plains so that the mammoth will run over the cliff?"
+
+Finally, we have the Ugly. We uglies are experienced technical developers, wise enough to not trust technology, especially technology that is boastful and arrogant enough to claim some kind of uniqueness. We uglies know that most technology is bullshit, and the louder the marketing, the worse it is. We make a lot of stuff ourselves because we like things to work for 20 years. When we come to 0MQ, we start trying to fit the Guide to our problems, and soon we give up in a mix of frustration and anger.
+
+Now I'm not calling Tavis Rudd "ugly", and indeed he looks quite handsome in his [https://twitter.com/tavisrudd Twitter profile pic], but as he says, "//finding the ZeroMQ guide a very frustrating read. Great software, but the guide is too chatty, too boastful and poorly structured. True root of my frustration w the zeromq guide was wanting to use req/rep for something I'm much better off doing with plain bsd sockets//".
+
+A good designer always takes the blame. As 0MQ gets more popular, we get a bigger spread of reactions to the learning curve. Early users were a subset of the Bad (let's call them the Evil), who had already figured out why they wanted decentralized messaging. For them, 0MQ was a godsend, and they would have read the source code to figure out how to use it. The Guide was therefore aimed squarely at the other early users, the Good, who were new to messaging and wanted a full story to buy into. Good and Evil, the ingredients of every great creation myth.
+
+++ 0MQ Is Just Like BSD Sockets, But Better
+
+The other essential ingredients of a creation myth are lies and deception. 0MQ is nothing at all like BSD sockets despite very insistent attempts from its early designers to make that. Yes, the API is vaguely socket-like. APIs are not the same as semantics. 0MQ patterns are weird and wonderful and delicate but they are not, and I'll repeat this, even marginally close to the BSD "stream of bytes from sender to recipient" pattern.
+
+It's worse than that. The closest match in 0MQ is the PAIR socket, which is kind of broken in {{libzmq}}, and which we use only for inter-thread pipes. So innocent Uglies like Tavis start with request-reply sockets, and soon discover that not only is 0MQ not like BSD sockets "on steroids" but the very simplest 0MQ patterns are useless for them. Request-reply isn't just contrived and weird, it's //also// broken in interesting ways and is really just a teaching tool for people to get into the //real// 0MQ socket patterns: publish-subscribe, push-pull, and router-dealer.
+
+Happily, sometime in 2012, one of the random passing geniuses who contributes to 0MQ came up with a patch that gave the ROUTER socket so-called "RAW" powers. It's about as sane as adding a lighter to your smartphone in an age where most people are just switching from coal to gas. The lighter is surprisingly useful when interfacing with primitive fire-based systems. It makes zero sense in an electricity-based world, but software is more like something from a steampunk comic, a mix of technologies of all ages.
+
+When we explain 0MQ to the Good, we start at the beginning with the request-reply pattern and move through hundreds of pages to the real gold. I can really imagine how frustrating it must be to come with decades of experience of networking and have to wade through hundreds of pages of explanation to come to the right answer.
+
+Of course, if everyone asked the right questions up-front, life would be simpler.
+
+The question Tavis didn't really ask was (afaics), "how do I replace plain BSD sockets with 0MQ, gradually moving to more interesting use-cases?"
+
+Which I'll try to answer, thanks to [https://github.com/hshardeesi hshardeesi] and his RAW patch. Let's assume we're talking about TCP, because UDP is special in its own cute ways.
+
+++ Moving from BSD Sockets to 0MQ Sockets
+
++++ Step One: Raw STREAM sockets
+
+First, we'll get a 0MQ socket talking to a classic TCP socket. Then we'll morph that into a 0MQ-to-0MQ connection. Let's break this down into steps:
+
+* Forget REQ, REP, and PAIR sockets, We're going to use a ZMQ_STREAM socket. This used to be a ZMQ_ROUTER socket with a special "raw" option, but in ZeroMQ 4.0 we got a dedicated socket type for this.
+
+* The router socket acts as a server, so bind it to a {{tcp://}} endpoint that you expect clients to connect to.
+
+* You can talk to clients //after// they talk to you, and you can also connect to a server and then start talking to it. We'll use the first model here.
+
+* You read messages from the socket one after the other, either using blocking {{zmq_recv}} calls, or using {{zmq_poll}}. Each message has two frames. The first frame is the handle of the client (0MQ calls this the "identity"). The second frame is the received data, which is 1 or more bytes.
+
+* To send data back to a specific client, you first send the handle, and then the data, as two frames. If you want to close a client connection, send the handle and then an empty frame.
+
+That's it. The router socket takes care of all the multiplexing, error handling, polling, and so on, and does this in a background I/O thread so it's fast.
+
+What kind of havoc can we create using a raw router socket? How about a web server? That's always fun. OK, here's a 30-line HTTP server in C. This little animal doesn't do much real work. It reads requests, logs them, chucks them out, and answers "Hello, World!":
+
+[[code type="example" title="HTTP Server" name="zhttpd"]]
+[[/code]]
+
+[https://gist.github.com/hintjens/5480625 Get the code.]
+
+To make this into a real server we'd have to add at least a few things:
+
+* Read a full HTTP request header, which means keep reading and accumulating data until we find a blank line (two carriage-returns) in the data.
+
+* Parse the HTTP request to see if the client has asked us for something we can handle, e.g. to GET a resource.
+
+* Map that resource name into a real filename (if that's what we're trying to do).
+
+* Open the file, and send its contents to the client.
+
+But that's classic RFC2616 stuff and not relevant to 0MQ, so not really worth talking about more. 2616ing used to be a full-time hobby but honestly, 0MQ is way more fun.
+
++++ Step Two: ROUTER to DEALER
+
+So, you've now seen how 0MQ can talk to BSD sockets. It's not perfect: for one thing, we can't write clients like this. That sucks. If anyone wants to fix this, perhaps allow outgoing connections on a RAW ROUTER socket, resulting in a null message back to the caller, with an identity and zero body.
+
+Anyhow, what's the next step? Let's replace the BSD TCP socket with a DEALER socket. It's not a perfect match but it's close enough to make a good party. If we connect DEALER to exactly one ROUTER, the DEALER just reads and writes like a TCP socket, with some small but oh-so-valuable differences:
+
+* We can write any amount of data //as a single message// and it will arrive //as a single message//. This is awesome because using a classic TCP protocol like HTTP means doing a lot of dancing around the pot to figure out when a request or response is finished. Framing, young man, the future is in framing!
+
+* The DEALER socket will connect opportunistically. Again, a small but awesome improvement on the BSD style of networking. Just connect one time, then use the socket for ages. It'll disconnect and reconnect as the network shifts. Perhaps the ROUTER socket will decide it wants to flush connections. No problem! The DEALER will reconnect later.
+
+DEALER does quite a lot more than this. It can connect to many ROUTERs and will distribute requests among them. Load-balancing, for free. It does fair queuing on input, so if you're getting a gigabyte of messages from one ROUTER, and another sends you a 10-byte urgent message, that will sneak in front.
+
+Doing a DEALER-to-ROUTER pseudo-HTTP is of course weird, it's just an exercise. We'll call the protocol WTFP, and it looks (nothing at all) like HTTP over ZeroMQ framing:
+
+[[code type="example" title="WTFP Server" name="zwtfpd"]]
+[[/code]]
+
+[https://gist.github.com/hintjens/5480688 Get the code.]
+
++++ Satori
+
+So now we've seen how 0MQ can roughly imitate BSD sockets, talk to them, and then fark them up beyond all recognition. DEALER-ROUTER is what we use in most real large-scale architectures, because it lets us build real bidirectional protocols. But there's also PUSH-PULL and PUB-SUB, which are fun. Not to mention using 0MQ for in-process multithreading. When you think of distribution not just as "outer" but also "inner", you start to see just how ambitious and arrogant this library is.
+
+Hope you enjoyed the article. Let me know what you want me to write about next.

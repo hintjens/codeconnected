@@ -1,0 +1,612 @@
+zcurve
+
+Compatibility with 0MQ
+
+    - layered above sockets
+    - secure socket layer (zcurve socket)
+    - route independent
+        - any connection
+        - any transport
+        - any intermediaries
+    - one peer to one peer
+        - any peer can be 'client' or 'server'
+        - same logic in both
+        - accepting connections
+    - work out over different socket patterns
+    - each message is equal to a UDP packet in CurveCP sense
+
+
+Build per instructions:
+
+    wget http://hyperelliptic.org/nacl/nacl-20110221.tar.bz2
+    bunzip2 < nacl-20110221.tar.bz2 | tar -xf -
+    cd nacl-20110221
+    ./do
+
+Install into /usr/local
+
+    cd build/myboxname
+    cp include/amd64/*.h /usr/local/include
+    cd lib/amd64
+    ar r libnacl.a randombytes.o
+    cp libnacl.a /usr/local/lib
+    cd ../..
+    cp bin/amd64/bin/curve* /usr/local/bin
+    cd ../..
+
+Client needs to know:
+
+    * server long-term public key
+    * server IP address to connect to
+    * server UDP port to talk to
+    * server extension, 16-bytes, used for secondary forwarding
+    * server domain name, string, used for virtual hosts
+
+Clients packets include:
+
+    * client short-term public key
+    * client IP address for reply packets
+    * client UDP port to talk to
+    * client extension, 16 bytes from /etc/curvecpextension or 16 zero bytes
+    
+Backup servers
+
+    * connect to multiple IP addresses at once / in parallel
+
+Mobile clients
+
+    * server allows new address in verified packet from client
+    * fully separate connection from security
+
+    
+    +----------------+
+    |    CurveCP     |
+    +----------------+
+    |      UDP       |
+    +----------------+
+    |      IPv4      |
+    +----------------+
+    
+    +----------------+
+    |     zcurve     |
+    +----------------+
+    |      0MQ       |
+    +----------------+
+    |      TCP       |
+    +----------------+
+    |      IPv4      |
+    +----------------+
+
+
+zcurve uses high-speed high-security elliptic-curve cryptography to protect every message against espionage, corruption, and sabotage.
+
+
+Packets
+    C:HELLO
+    S:COOKIE
+    C:INITIATE
+    S:MESSAGE ...
+    C:MESSAGE ...
+
+    If COOKIE is lost, client sends another HELLO
+    Server replies to each HELLO with a COOKIE
+    If MESSAGE is lost, client can resend INITIATE
+
+
+Box[X](C->S) is a cryptographic box,
+    encrypting and authenticating X
+    from the client's public key C
+    to the server's public key S
+
+    The only people who can
+        create Box[X](C->S)
+    are the people who know the secret key
+        corresponding to C
+
+    The only people who can
+        decipher Box[X](C->S)
+    are the people who know the secret key
+        corresponding to S.
+
+Hello packet:
+    (C', 0, Box[0'](C'->S))
+        C' is the client's short-term public key
+        S is the server's long-term public key
+        0 is zero-padding
+        0' is zero-padding
+
+Cookie packet:
+    (Box[S',K](S->C'))
+        S' is the server's short-term public key
+        K is a cookie
+
+    The cookie K is Box[C',s'](t),
+        where s' is the secret key
+            corresponding to S',
+        and t is a secret "minute key"
+            maintained by the server.
+        This is a cryptographic box that can be 
+        created and understood only by t.
+        
+Initiate packet with Vouch subpacket:
+    (C',K,Box[C,V,N,...](C'->S'))
+        C is the client's long-term public key
+        V=Box[C'](C->S)
+        N is the server's domain name
+        ... is a message
+        
+Message packet:
+    (Box[...](S'->C'))
+    ... is a message
+
+
+Packet format
+     8 byte packet type
+    16 byte target extension
+    16 byte sender extension
+    32 byte client short-term public key C' (server uses as connection ID)
+    BOX + nonce
+
+
+++ Client Hello packet details
+
+A Hello packet is a 224-byte packet with the following contents:
+
+    8 bytes: the ASCII bytes "QvnQ5XlH".
+    16 bytes: the server's extension.
+    16 bytes: the client's extension.
+    32 bytes: the client's short-term public key C'.
+    64 bytes: all zero.
+    8 bytes: a client-selected compressed nonce in little-endian form. This compressed nonce is implicitly prefixed by "CurveCP-client-H" to form a 24-byte nonce.
+    80 bytes: a cryptographic box encrypted and authenticated to the server's long-term public key S from the client's short-term public key C' using this 24-byte nonce. The 64-byte plaintext inside the box has the following contents:
+        64 bytes: all zero.
+
+    Current servers enforce the 64-byte length requirement but do not enforce the all-zero requirement.
+    The all-zero bytes in this packet are an anti-amplification mechanism, ensuring that Hello packets are as long as Cookie packets; this is why the 64-byte length requirement is enforced.
+    They are also an extension mechanism, allowing future protocol extensions such as hashcash; this is why the all-zero requirement is not enforced.
+    Clients must nevertheless be careful to follow the all-zero requirement to avoid confusing future servers that support extensions. 
+    
+++ Server Cookie packet details
+
+A Cookie packet is a 200-byte packet with the following format:
+
+    8 bytes: the ASCII bytes "RL3aNMXK".
+    16 bytes: the client's extension.
+    16 bytes: the server's extension.
+    16 bytes: a server-selected compressed nonce in little-endian form. This compressed nonce is implicitly prefixed by "CurveCPK" to form a 24-byte nonce.
+    144 bytes: a cryptographic box encrypted and authenticated to the client's short-term public key C' from the server's long-term public key S using this 24-byte nonce. The 128-byte plaintext inside the box has the following contents:
+        32 bytes: the server's short-term public key S'.
+        96 bytes: the server's cookie.
+
+++ Client Initiate packet details
+
+An Initiate packet is a (544+M)-byte packet with the following contents, where M is a multiple of 16 between 16 and 640:
+
+    8 bytes: the ASCII bytes "QvnQ5XlI".
+    16 bytes: the server's extension.
+    16 bytes: the client's extension.
+    32 bytes: the client's short-term public key C'.
+    96 bytes: the server's cookie.
+    8 bytes: a client-selected compressed nonce in little-endian form. This compressed nonce is implicitly prefixed by "CurveCP-client-I" to form a 24-byte nonce.
+    368+M bytes: a cryptographic box encrypted and authenticated to the server's short-term public key S' from the client's short-term public key C' using this 24-byte nonce. The (352+M)-byte plaintext inside the box has the following contents:
+        32 bytes: the client's long-term public key C.
+        16 bytes: a client-selected compressed nonce in little-endian form. This compressed nonce is implicitly prefixed by "CurveCPV" to form a 24-byte nonce.
+        48 bytes: a cryptographic box encrypted and authenticated to the server's long-term public key S from the client's long-term public key C using this 24-byte nonce. The 32-byte plaintext inside the box has the following contents:
+            32 bytes: the client's short-term public key C'.
+        256 bytes: the server's domain name, in DNS format (between 1 and 255 bytes), zero-padded to 256 bytes.
+        M bytes: a message.
+
+++ Server Message packet details
+
+A Message packet from the server is a (64+M)-byte packet with the following contents, where M is a multiple of 16 between 16 and 1088:
+
+    8 bytes: the ASCII bytes "RL3aNMXM".
+    16 bytes: the client's extension.
+    16 bytes: the server's extension.
+    8 bytes: a server-selected compressed nonce in little-endian form. This compressed nonce is implicitly prefixed by "CurveCP-server-M" to form a 24-byte nonce.
+    16+M bytes: a cryptographic box encrypted and authenticated to the client's short-term public key C' from the server's short-term public key S' using this 24-byte nonce. The M-byte plaintext inside the box has the following contents:
+        M bytes: a message.
+
+++ Client Message packet details
+
+A Message packet from the client is a (96+M)-byte packet with the following contents, where M is a multiple of 16 between 16 and 1088:
+
+    8 bytes: the ASCII bytes "QvnQ5XlM".
+    16 bytes: the server's extension.
+    16 bytes: the client's extension.
+    32 bytes: the client's short-term public key C'.
+    8 bytes: a client-selected compressed nonce in little-endian form. This compressed nonce is implicitly prefixed by "CurveCP-client-M" to form a 24-byte nonce.
+    16+M bytes: a cryptographic box encrypted and authenticated to the server's short-term public key S' from the client's short-term public key C' using this 24-byte nonce. The M-byte plaintext inside the box has the following contents:
+        M bytes: a message.
+
+
++ Cryptographic Box & Nonce
+
+* box is encrypted & authenticated from sender's secret key to receiver's public key
+* sender chooses public 24 byte nonce
+
+Encrypt to server long term key (s=secret, S=public)
+    - client knows S
+    - nonce is "CurveCPK" + 16 byte compressed nonce
+
+Encrypt to client long term key (c=secret, C=public)
+    - server knows C
+    - nonce is "CurveCPV" + 16 byte compressed nonce
+
+Encrypt to server short term key (s'/S')
+    - client knows S'
+    - nonce is "CurveCP-server-M" + 8 byte compressed nonce
+    - nonce is increasing 64-bit integer
+    - little endian form
+
+Encrypt to client short term key (c'/C')
+    - server knows C'
+    - nonce is "CurveCP-client-"
+        + "H"/"I"/"M" for hello, initiate, message packets
+        + compressed nonce
+    - little endian form
+
+Short term nonces
+    - strictly increasing (H, I, M) and 8-byte number
+    - start anywhere, increase by any amount
+
+16-byte compressed nonce S:
+    - 8 byte counter + 8 random bytes
+    - encrypt these 16 bytes using a secret "nonce key"
+    - avoids leaking client numbers
+
+Several servers can use same long-term secret key
+    - each has to use separate nonces then
+    - how about internal nonce server?
+
+        +--------------+
+        | nonce server |
+        +--------------+
+            /      \
+    +---------+  +---------+
+    | message |  | message |
+    | server  |  | server  |
+    +---------+  +---------+
+
+    - too complex for initial case but maybe later
+
+Key distribution
+    - how about key server who's public key is known to all nodes
+    - clone model (name->public key)
+    
+    
+Wrapping NACL
+
+Crypto::PublicKey.new
+Crypto::PrivateKey.new
+Crypto::PrivateKey.generate
+Crypto::Random.random_bytes
+Crypto::Random_bytes
+Crypto::Util.zeros
+Crypto::Util.verify32
+
+Crypto::Box.new().box
+Crypto::Box.new().open
+Crypto::Box.new().unpack
+Crypto::SecretBox.new().box
+Crypto::SecretBox.new().open
+
+
+long term nonce
+    - 16 bytes (e.g. 8 sequential, 8 random)
+    - strictly increasing, little endian comparison
+    - never reused (e.g. persisted or served)
+    - distinct ranges for each client so no leakage
+
+Generating a cookie
+
+    Cookie K is Box [C', s'](t),
+        -> client short term public key C'
+         + server short term private key s'
+         encrypted by the minute key t
+        -> nonce is any unique number
+
+    - nonce = long term nonce counter => 16 bytes
+    - message is client short-term public key + server short-term private key
+        - 32 bytes each
+    - key is minute key (32 random bytes)
+    - encryption nonce is 8-byte prefix + nonce => 24 bytes
+    - create secretbox ciphertext => 80 bytes
+    - cookie = 16-byte nonce + ciphertext => 96 bytes
+
+Checking a cookie
+
+    - cookie = 96 bytes
+        - 16-byte nonce + 80 byte ciphertext
+    - encryption nonce is 8-byte prefix + nonce => 24 bytes
+    - open secret box using current minute key
+        => 64 bytes plaintext
+    - if successful, get client short-term public key and server short-term private key
+    
+Generating a vouch
+    Vouch V is Box [C'](C->S)
+        -> client short term public key
+        encrypted from client LT private key to server LT public key
+        
+    nonce = CurveCPV + 16 random bytes (not strictly increasing)
+    plain = client ST public key, 32 bytes
+    vouch = 16-byte nonce + ciphertext => 64 bytes
+    
+
++ Over 0MQ
+
+++ C:HELLO Command (192 bytes)
+
+    8 bytes
+        command identifier "QvnQ5XlH"
+    32 bytes
+        client short-term public key C'
+    64 bytes
+        all zero, anti-amplification padding
+        HELLO should be >= COOKIE to avoid amplification attacks
+    8 bytes
+        client nonce, implicitly prefixed by "CurveCP-client-H"
+        strictly increasing 64-bit integer, little endian form
+        - short-term nonce
+    16 + 64 bytes
+        Box [64 * %x0](C'->S)
+    
+++ S:COOKIE Command (168 bytes)
+
+    8 bytes
+        command identifier "RL3aNMXK"
+    16 bytes
+        nonce for server long-term key
+        prefix: "CurveCPK"
+        - not increasing
+        -> 16 byte random
+        -> (8 byte sequential + 8 byte random) encrypted with nonce key
+        -> strategy can be expanded and improved
+    16 + 128 bytes
+        Box [S' + cookie] (S->C')
+        * server short-term public key S'
+        * server cookie, 96 bytes
+
+++ C:INITIATE Command
+
+    8 bytes
+        command identifier "QvnQ5XlI"
+    32 bytes
+        client short-term public key C'
+    96 bytes
+        server cookie
+    8 bytes
+        client nonce, implicitly prefixed by "CurveCP-client-I"
+        strictly increasing 64-bit integer, little endian form
+        - short-term nonce
+    16 + 96
+        Box [C + nonce + vouch](C'->S')
+        * client long-term public key C
+        * client nonce, 16 random bytes (same as CurveCPK)
+            - prefixed by "CurveCPV" to give 24-byte nonce
+        * client vouch, 48 bytes
+        //DROP * server hostname, zero-padded to 256 bytes
+        //DROP * M bytes of message
+
+++ S:MESSAGE
+
+    8 bytes
+        command identifier "RL3aNMXM"
+    8 bytes
+        server nonce, implicitly prefixed by "CurveCP-server-M"
+        strictly increasing 64-bit integer, little endian form
+        - short-term nonce
+    16 + M bytes
+        Box [M](S'->C')
+
+++ C:MESSAGE
+
+    8 bytes
+        command identifier "QvnQ5XlM"
+    32 bytes
+        client short-term public key C'
+    8 bytes
+        client nonce, implicitly prefixed by "CurveCP-client-M"
+        strictly increasing 64-bit integer, little endian form
+        - short-term nonce
+    16 + M bytes
+        Box [M](C'->S')
+
+SASL:
+    C:"CurveCP" mechanism + HELLO blob
+    S:COOKIE
+    C:INITIATE
+    S:MESSAGE... after C:INITIATE
+    C:MESSAGE... after S:MESSAGE
+
+/dev/random
+    - diskless, live CD, embedded, router
+    - may block in some cases
+    
+short term nonce
+    - strictly increasing 64-bit number
+long term nonce
+    - 16 random bytes
+
++ libsodium
+
+Linux, Windows, iOS, Android
+fully packaged
+
+
++ Integration levels
+
+    FileMQ
+        - using SASL model
+        - extensible to any SASL mechanism
+        - only for this one application
+    CZMQ
+        - using zcurve class
+        - for ROUTER/DEALER only (not PUB/SUB)
+    libzmq
+        - in transport layer
+        - for all TCP sockets including PUB/SUB
+
+        - would work for all socket types over tcp
+        - clients need to know server public key
+        - server MAY validate clients based on their public keys
+            - many clients can share same public key
+            - easy to revoke access to groups of clients
+
+        - configure:
+            set server long term public key -> socket option before connect
+            set client long term public key -> ctx option
+            set client long term secret key -> ctx option
+            bind = server
+            connect = client
+        - context:
+            server_public
+            client_public
+            client_secret
+            cn_public
+            cn_secret
+            cn_server
+            cn_nonce
+
+If we do this at the libzmq level, we need to modify ZMTP. The socket type and identity needs to be confidential to avoid attacks and avoid leaking information about peer.
+
+    - revision 2 (ZMTP/2.1)
+        - backwards compatible with 0 and 1
+
+    - set security on socket before binding or connecting
+        - bind -> server
+        - connect -> client
+    - set server public key & secret key before binding
+    - set client public key & secret key before connecting
+    - set server public key before connecting
+    - server: filter client public keys, optional, later
+    
+    - pass the real values in INITIATE command
+    - wait for matching header, or close connection
+
+    - client passes secure/mechanism in header
+        - in place of socket/identity
+        - C0 + [6]ZCURVE
+    - server accepts or rejects mechanism
+        - server MUST be secure to accept secure client
+
+    - send identity messages; state machine in server & client
+        
+
+Context/objects
+
+    server socket
+        private key
+        public key
+        optional: set of client public keys for authentication
+        hash table per client connection key
+        
+    server connection:
+        cn_client   client connection key
+        cn_public   server connection key
+        cn_secret   server connection lock
+        cn_nonce    server connection nonce
+        cn_cookie   server cookie key, current
+        cn_cookien  server cookie key, minute old
+
+    server methods
+        state = expect hello
+        parse HELLO
+            if valid,
+                set cn_client
+                send COOKIE
+                state = expect initiate
+            else
+                return invalid
+        parse INITIATE
+            if valid
+                state = expect message
+        send MESSAGE
+                
+
+    client methods
+        send HELLO
+            state = expect cookie
+
+        parse cookie command
+            if valid
+                send INITATE
+                state = expect message
+                
+        send MESSAGE
+
+- no minute key, no point
+    - single client
+    - cookie expires in X seconds
+- asserts -> drop messages
+- message size fixed & limited
+- client key in message so via any route
+- add server key in message, allows N servers / fanin
+    - check handshaking will also work
+    -> remove client key, over 1 connection only
+- no hostname in initiate
+- no message in initiate
+- single command structure for MESSAGE
+- variable length messages -> length + body
+
+
+curvezmq
+
+    - how to handle failed boxes in connection?
+        - drop them, must be attacker
+    - how to detect and handle lost (attacked) messages
+
+++ Use case for zcurve
+
+    ... across older zmtp protocols
+    ... end-to-end across untrusted proxies
+    ... example of this in filemq?
+
+-> move out of CZMQ
+    -> into clab
+    -> experimental classes
+    -> may move down into czmq if stable & useful
+    -> cl_something
+    -> libclab
+    
+    -> cl_curve
+    -> cl_socket
+    -> cl_plain
+    
+    -> standard API for curve/plain mechanisms
+    -> encode/decode etc.
+    -> set-up jump table
+    
+    
+
+curvezmq API in CZMQ
+
+    zcurve
+        - basic encoding and decoding
+        - no I/O
+        DONE
+        - authentication via ZAP
+        
+    zsecure
+        - secure socket API
+        - extensible mechanisms, drivers
+        - front-end / back-end model like VTX
+        - use VTX framework as basis
+        - API is like sockets:
+            - new (type)
+            - set ("property", value)
+            - get ("property", value)
+            - send (msg)
+            - recv (msg)
+            - handle - for polling
+            
+    zsecure_curve
+        - mechanism for CurveZMQ
+        
+    zsecure_plain
+        - mechanism for plain authentication
+        
+end-to-end security?
+
+    DEALER - forwarder - forwarder - ROUTER
+

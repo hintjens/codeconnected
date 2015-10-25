@@ -1,0 +1,376 @@
+One long-standing question for 0MQ developers is how to discover services on the network. A lot of people have built answers to this, such as [http://stackoverflow.com/search?page=2&tab=relevance&q=zeroconf ZeroConf] and [http://stackoverflow.com/search?q=upnp UPnP], or even DNS, but they tend to be over-complex and unfriendly to application developers. In this article I'll explain [https://github.com/zeromq/czmq/blob/master/src/zbeacon.c zbeacon], which is a new module in the [http://czmq.zeromq.org CZMQ binding for 0MQ] that does service discovery.
+
+[[toc]]
+
+++ The Discovery Problem
+
+Discovery is an essential part of network programming and a first-class problem for 0MQ developers. Every {{zmq_connect ()}} call has to provide an endpoint string and that has to come from somewhere. There are a lot of answers but none that work well across the board.
+
+[[=image image1.jpg size="medium"]]
+
+Here is a list of the the solutions I know for discovery:
+
+* //Use hard-coded endpoint strings//, i.e., fixed IP addresses and agreed ports. This worked in internal networks a decade ago when there were a few "big servers" and they were so important they got static IP addresses. These days however it's no use except in examples or for in-process work (threads are the new Big Iron). You can make it hurt a little less by using DNS but this is still painful for anyone who's not also doing system administration as a side-job.
+
+* //Get endpoint strings from configuration files//. This shoves name resolution into user space, which hurts less than DNS but that's like saying a punch in the face hurts less than a kick in the groin. You now get a nonb-trivial management problem. Who updates the configuration files, and when? Where do they live? Do we install a distributed management tool like Salt Stack?
+
+* //Use a message broker//. You still need a hard-coded or configured endpoint string to connect to the broker, but this approach reduces the number of different endpoints in the network to one. That makes a real impact, and broker-based networks do scale nicely. However, brokers are single points of failure, and they bring their own set of worries about management and performance.
+
+* //Use an addressing broker//. In other words use a central service to mediate address information (like a dynamic DNS setup) but allow nodes to send each other messages directly. It's a good model but still creates a point of failure and management costs.
+
+* //Use helper libraries, like ZeroConf//, that provide DNS services without any centralized infrastructure. It's a good answer for certain applications but your mileage will vary. Helper libraries aren't zero cost: they make it more complex to build the software, they have their own restrictions, and they aren't necessarily portable.
+
+* //Build system-level discovery// by sending out ARP or ICMP ECHO packets and then querying every node that responds. You can query through a TCP connection, for example, or by sending UDP messages. Some products do this, like the Eye-Fi wireless card.
+
+* //Do user-level brute-force discovery// by trying to connect to every single address in the network segment. You can do this trivially in 0MQ since it handles connections in the background. You don't even need multiple threads. It's brutal but fun, and works very well in demos and workshops. However it doesn't scale, and annoys decent-thinking engineers.
+
+* //Roll your own UDP-based discovery protocol//. Lots of people do this (I counted about 80 questions on this topic on StackOverflow). UDP works well for this and it's technically clear. But it's technically tricky to get right, to the point where any developer doing this the first few times will get it dramatically wrong.
+
+++ The Use Case
+
+[[size 180%]]Our use case isn't here and now, it's ten or twenty years from today.[[/size]]
+
+[[=image image2.jpg size="medium"]]
+
+Let's define our use case more explicitly. After all, all these different approaches have worked and still work to some extent. What interests me as architect is the future, and finding designs that can continue to work for more than a few years. This means identifying long term trends. Our use case isn't here and now, it's ten or twenty years from today.
+
+Here are the long term trends I see in distributed applications:
+
+* //The overall number of moving pieces keeps increasing//. My estimate is that it doubles every 24 months, but how fast it increases matters less than the fact that we keep adding more and more nodes to our networks. They're not just boxes but also processes and threads. The driver here is cost, [http://softwareandsilicon.com/ which keeps falling]. In a decade, every person will have 30-50 devices on them, all the time.
+
+* //Control shifts away from the center//. Possibly data too, though we're still far from understanding how to build simple decentralized information stores. In any case, the star topology is slowly dying and being replaced by clouds of clouds. In the future there's going to be much more traffic within a local environment (home, office, school, bar) than between remote nodes and the center. The maths here are simple: remote communications cost more, run more slowly and are less natural than close-range communications. It's more accurate both technically and socially to share a holiday video with your friend over local WiFi than via Facebook.
+
+* //Networks are increasingly collaborative, less controlled//. This means people bringing their own devices and expecting them to work seamlessly. The Web showed one way to make this work but we're reaching the limits of what the Web can do, as we start to exceed the average of one device per person. 
+
+* //The cost of connecting a new node to a network must fall proportionally//, if the network is to scale. This means reducing the amount of configuration a node needs: less pre-shared state, less context. Again, the Web solved this problem but at the cost of centralization. We want the same plug and play experience but without a central agency.
+
+In a world of trillions of nodes, the ones you talk to most are the ones closest to you. This is how it works in the real world and it's the sanest way of scaling large-scale architectures. Groups of nodes, logically or physically close, connected by bridges to other groups of nodes. A local group will be anything from half-a-dozen nodes to a few thousand nodes.
+
+[[size 180%]]If you haven't simulated and fixed the three most likely failures, they'll still be there on opening day.[[/size]]
+
+So we have two basic use cases:
+
+* **Discovery for proximity networks**, that is, a set of nodes that find themselves close to each other. We can define "close to each other" as being "on the same network segment". It's not going to be true in all cases but it's true enough to be a useful place to start.
+
+* **Discovery across wide area networks**, that is, bridging of proximity networks together. We sometimes call this "federation". There are many ways to do federation but it's complex and something to cover elsewhere. For now, let's assume we do federation using a centralized broker or service.
+
+So we are left with the problem of proximity networking. I want to just plug things into the network and have them talking to each other. Whether they're tablets in a school or a bunch of servers in a cloud, the less upfront agreement and coordination, the cheaper it is to scale. So configuration files and brokers and any kind of centralized service are all out.
+
+I also want to allow any number of applications on a box, both because that's how the real world works (people download apps), and so that I can simulate large networks on my laptop. Upfront simulation is the only way I know to be sure a system will work when it's loaded in real-life. You'd be surprised how engineers just hope things will work. "Oh, I'm sure that bridge will stay up when we open it to traffic". If you haven't simulated and fixed the three most likely failures, they'll still be there on opening day.
+
+Running multiple instances of a service on the same machine - without upfront coordination - means we have to use ephemeral ports, i.e., ports assigned randomly for services. Ephemeral ports rule out brute-force TCP discovery and any DNS solution including ZeroConf.
+
+Finally, discovery has to happen in user space because the apps we're building will be running on random boxes that we do not necessarily own and control. For example, other people's mobile devices. So any discovery that needs root permissions is excluded. This rules out ARP and ICMP and once again ZeroConf since that also needs root permissions for the service parts.
+
+++ Technical Requirements
+
+[[size 180%]]There are so many edge cases in ad-hoc networks that every extra feature or functionality becomes a risk.[[/size]]
+
+[[=image image3.jpg size="medium"]]
+
+Let's recap the requirements:
+
+* //The simplest possible solution that works//. There are so many edge cases in ad-hoc networks that every extra feature or functionality becomes a risk.
+
+* //Supports ephemeral ports//, so that we can run realistic simulations. If the only way to test is to use real devices, it becomes impossibly expensive and slow to run tests.
+
+* //No root access needed//, it must run 100% in user space. We want to ship fully-packaged applications onto devices like mobile phones that we don't own and where root access isn't available.
+
+* //Invisible to system administrators//, so we do not need their help to run our applications. Whatever technique we use should be friendly to the network and available by default.
+
+* //Zero configuration// apart from installing the applications themselves. Asking the users to do any configuration is giving them an excuse to not use the applications.
+
+* //Fully portable// to all modern operating systems. We can't assume we'll be running on any specific OS. We can't assume any support from the operating system except standard user-space networking. We can assume 0MQ and CZMQ are available.
+
+* //Friendly to WiFi networks// with up to 100-150 participants. This means keeping messages small and being aware of how WiFi networks scale and how they break under pressure.
+
+* //Protocol-neutral//, i.e., our beaconing should not impose any specific discovery protocol. I'll explain what this means a little later.
+
+* //Easy to re-implement in any given language//. Sure, we have a nice C implementation, but if it takes too long to reimplement in another language, that excludes large chunks of the 0MQ community. So, again, simple.
+
+* //Fast response time//. By this, I mean a new node should be visible to its peers in a very short time, a second or two at most. Networks change shape rapidly. It's OK to take longer, even 30 seconds, to realize a peer has disappeared.
+
+++ The zbeacon API
+
+[[size 180%]]The only option that isn't disqualified is building our own UDP-based discovery stack.[[/size]]
+
+From the list of possible solutions I collected, the only option that isn't disqualified for one or more reasons is to build our own UDP-based discovery stack. It's a little disappointing that after so many decades of research into network discovery, this is where we end up. But the history of computing does seem to go from complex to simple, so maybe it's normal.
+
+Which brings us to zbeacon. This is a little decentralized pub-sub machine that uses UDP broadcast messages to discover peers on a local area network and bootstrap a 0MQ dialog. A beacon either listens, or broadcasts, or does both. I originally built this code as part of [http://zyre.com the Zyre project], and moved it into CZMQ when Michel Pelletier pointed out that it could be more generally useful to developers using 0MQ.
+
+The zbeacon module is in CZMQ/1.4.0 and later versions. Get this [https://github.com/zeromq/czmq from GitHub]. The module follows the standard conventions for creating and destroying instances:
+
+[[code]]
+//  Create a new beacon on a certain UDP port
+zbeacon_t *
+    zbeacon_new (int port_nbr);
+
+//  Destroy a beacon
+void
+    zbeacon_destroy (zbeacon_t **self_p);
+[[/code]]
+
+On a new beacon you can ask for the hostname, which is the IP address the beacon actually uses. The zbeacon module will look for the best broadcast interface to use. This means: WiFi if that's available, otherwise the last Ethernet interface if there are several:
+
+[[code]]
+//  Return our own IP address as printable string
+char *
+    zbeacon_hostname (zbeacon_t *self);
+[[/code]]
+
+You can create multiple beacons on the same port, but it's probably wisest to use one port for one application or discovery protocol. The way UDP broadcasts work, each socket bound to a port will receive all traffic coming into that port. It's somewhat like a 0MQ pub-sub model and the zbeacon module continues that pub-sub theme.
+
+A beacon can send and/or receive. We could have invented separate publisher and subscriber concepts but that would make a more complex API. Here's how you start and stop publishing data on a beacon:
+
+[[code]]
+//  Start broadcasting beacon to peers at the specified interval
+void
+    zbeacon_publish (zbeacon_t *self, byte *transmit, size_t size);
+[[/code]]
+
+The data is a binary opaque blob. Each call to {{zbeacon_publish ()}} overwrites the previous one, so if you want to publish several different beacons for some reason, you should create multiple zbeacon instances. A beacon gets broadcast as soon as you call {{zbeacon_publish ()}}. The default interval is once per second but you can change this. You can set the interval before starting to publish, or afterwards:
+
+[[code]]
+//  Set broadcast interval in milliseconds (default is 1000 msec)
+void
+    zbeacon_set_interval (zbeacon_t *self, int interval);
+[[/code]]
+
+To start receiving data on a beacon, you subscribe, and this works exactly like a 0MQ SUB socket subscription: you set a prefix that filters received messages. To get all beacons, set a filter of NULL and size 0:
+
+[[code]]
+//  Start listening to other peers; zero-sized filter means get everything
+void
+    zbeacon_subscribe (zbeacon_t *self, byte *filter, size_t size);
+[[/code]]
+
+[[size 180%]]Since zbeacon sends and receives raw data you can use it to talk to existing UDP-based discovery services.[[/size]]
+
+Since zbeacon sends and receives raw data (i.e., without imposing any wire format whatsover) you can use it to talk to existing UDP-based discovery services. I didn't list this as a requirement since it's not been raised by anyone, but it seems useful.
+
+Most applications will start broadcasting or listening and then continue forever. However you can switch either off if you need to:
+
+[[code]]
+//  Stop broadcasting beacons
+void
+    zbeacon_silence (zbeacon_t *self);
+
+//  Stop listening to other peers
+void
+    zbeacon_unsubscribe (zbeacon_t *self);
+[[/code]]
+
+UDP broadcasts do have the annoying habit of coming back to the sender as if they came from other places on the network. This means you need to do some extra work to detect and throw away your own beacons. The usual technique to add a unique sender ID into each beacon, and then filter out received beacons that have your own ID. Since zbeacon doesn't impose any wire format, so you can design your own protocols cleanly, you must do the "add unique ID" part yourself. I'll explain in more detail what this involves, a little later.
+
+Note that although we do know the IP address of whomever sent us a UDP message, that doesn't map 1-to-1 to a sending node. All beacons on the same system will send out via the same IP address.
+
+What zbeacon can do to help is filter out our own beacons, which we call //echoes//, if you tell it to. Just make sure your {{zbeacon_publish ()}} data includes a unique identifier and then use this call:
+
+[[code]]
+//  Filter out any beacon that looks exactly like ours
+void
+    zbeacon_noecho (zbeacon_t *self);
+[[/code]]
+
+Finally, we need a way to receive beacon messages. The zbeacon API delivers these on a //pipe//, which is a 0MQ socket. You poll this pipe and receive messages from it:
+
+[[code]]
+//  Get beacon pipe, for polling or receiving messages
+void *
+    zbeacon_pipe (zbeacon_t *self);
+[[/code]]
+
+Do NOT send messages to the pipe, or bad things will happen. The pipe is in fact a PAIR socket that connects a zbeacon background thread with the foreground API. We use the pipe to send API commands through to the backend. However those commands are not documented, not part of any public contract, and are liable to change arbitrarily.
+
+All messages you receive off the pipe have two frames:
+
+* The IP address of the sender, formatted as a string.
+* The beacon data itself.
+
+++ Cross-Language Interoperability
+
+The actual protocol zbeacon uses is simple to describe and should be doable in other languages:
+
+* We open a UDP broadcast socket and bind to a selected network interface.
+* We send a message to that socket at the configured interval.
+* We receive messages from that socket, filter them, and pass them to our application.
+
+The hardest work, which forms a large chunk of the zbeacon code, is getting the right interface to send on. It's not portable. So an alternative to re-implementing zbeacon in another language would be to wrap this module.
+
+++ Discovery Protocols
+
+[[=image image4.jpg size="medium"]]
+
+While zbeacon does a lot of the ugly non-portable work, it's most definitely not a discovery protocol. There are a number of things you will want to add to make a viable protocol. A lot of these are already done in [http://rfc.zeromq.org/spec:20 ZRE] so you could use that as an inspiration. I'll explain anyhow.
+
+Before getting into the technical meat, I'll share one thing we learned from Zyre: a good mix of UDP broadcasts plus 0MQ-over-TCP works nicely. Trying to build the whole discovery protocol in UDP would not be so simple, and would probably not scale well, due to packet loss as networks get saturated.
+
+Let me work through the problems you will or may need to solve, with a solution for each one. This design could be  abstracted into a separate discovery protocol that underlies ZRE, and one day we might do that. It could be nice to have a single reusable discovery protocol for all 0MQ applications.
+
++++ Reject Garbage
+
+* Problem: anyone can send garbage to the UDP broadcast port, which we have to filter.
+* Solution: start each beacon with some constant data which we can check for.
+
+In ZRE we place the three bytes "ZRE" at the start of every UDP message. Usually a check on this header, and on the message size is enough to filter out garbage. Note that "garbage" can be other applications innocently using the same UDP port, different versions of the same application, or rogue applications looking for vulnerabilities.
+
++++ Unique Identifiers
+
+* Problem: we receive our own UDP broadcast messages.
+* Solution: add a unique identifier to the beacon, and throw away beacons that contain this identifier.
+
+The difficulty is that a globally unique identifier is 16 bytes, which is a little long. It's certainly not optimal when our networks can hold at most a few hundred devices before breaking for other reasons. In ZRE we use a GUID just because it's boring and safe but since on WiFi there's a direct trade-off between beacon size and responsiveness (you can afford to send shorter beacons more frequently), it would be worth studying how to make shorter unique IDs. One plausible strategy would be to use the last two bytes of the IP address, and a system-wide unique identifier (also two bytes).
+
++++ Endpoint Specification
+
+* Problem: the sender IP address isn't sufficient to identify an endpoint.
+* Solution: add endpoint information into the beacon.
+
+At the least, you may want to specify a port number to connect to, which will often be an ephemeral port. You can extend the endpoint information in whatever direction your architecture needs, of course. For instance, providing a PGM endpoint, or adding socket type information if that's not hard-coded in your protocol.
+
++++ Meta-Data
+
+* Problem: we want to provide more information than just the endpoint.
+* Solution: bootstrap into a TCP connection using 0MQ and extend the conversation there.
+
+You really don't want to add meta-data to the UDP beacon. If you're sending the same data over and over then you're wasting bandwidth in ways that can break your network as you scale to more peers. And if you're changing the meta-data regularly, then you're assuming UDP broadcasts are reliable, which they are //most definitely not//.
+
+This is the logic we use in ZRE:
+
+* Get a beacon message.
+* Is this a new peer? If so, open a connection to it and send a HELLO command.
+* If not, treat this as a heartbeat from an existing peer.
+
+The HELLO command holds the meta-data in a key-value table and since this command is sent only once per discovery, it can be much larger than a beacon without doing harm. ZRE for example lets you say things like, "this node also supports the logging service on port 9898".
+
++++ Proxy Discovery
+
+* Problem: I want to try to reduce the number of beacons to a real minimum.
+* Solution: allow nodes to delegate their beaconing to other nodes.
+
+For example, in the HELLO command, a peer could say, "and here are the other nodes I know about". Then, if you see yourself in that list, you could stop broadcasting your own beacon, at least for a while. Is this worth doing? Honestly, I don't think it is. Just keep the UDP beacon as small as it can be, and don't create dependencies between nodes that you can avoid.
+
++++ Unreliable UDP
+
+* Problem: as my network gets loaded, UDP messages get dropped.
+* Solution: use TCP to recover from dropped UDP beacons.
+
+Trying to do too much with UDP on WiFi networks is a bad idea unless you're happy with losing chunks of data. TCP will either work, or fail, but won't "kind of work". That means your states with TCP are clear: either you get the next message, or you get a timeout, or you get an error. The standard access point strategy of disconnecting clients when there's not enough bandwidth reinforces this "everything or nothing" outcome. But UDP is essentially a fuzzy state protocol that just gets fuzzier as the network gets stressed.
+
+The solution is to do the strict minimum with UDP (just beaconing), and switch to TCP as soon as possible. Now our only UDP failures will be dropped beacons. The classic outcome is that node A may see node B (having received its beacon) but B won't see A (the access point dropped A's beacon). To recover from this, we add endpoint information (IP address and port) into the HELLO command that a node sends to a new peer. The peer that receives HELLO can then check if it knows the sender and if not, treat that as a new peer (and send it HELLO back).
+
++++ Use of UDP Ports
+
+* Problem: we need an agreed UDP port number to work on.
+* Solution: use port 5670 and the ZRE discovery protocol.
+
+We got port 5670 from [http://www.iana.org IANA] for the ZRE-DISC protocol, i.e., UDP discovery for the ZRE protocol. In fact you can use this for any kind of discovery if you're prepared to either use the Zyre library, or take some of its code. Note, the Zyre code is LGPL, so that means you can't simply reuse it in your apps if they aren't LGPL. However, you can use the example code here freely.
+
+The way to extend ZRE-DISC with your own data is to bootstrap into a 0MQ (over TCP) dialog and send data in the first command. Personally, I'd just use Zyre for this.
+
+++ Worked Examples
+
+This sample code is put into the public domain: use it without worries.
+
++++ Publisher Service
+
+Here's a minimal example that creates a ZMQ_PUB socket on a fixed port and then announces it using zbeacon:
+
+[[code]]
+zctx_t *ctx = zctx_new ();
+
+//  Create a service socket and bind to an ephemeral port
+void *service = zsocket_new (ctx, ZMQ_PUB);
+int port_nbr = zsocket_bind (service, "tcp://*:*");
+
+//  Broadcast on UDP port 9999
+byte announcement [2] = { (port_nbr >> 8) & 0xFF, port_nbr & 0xFF };
+zbeacon_t *service_beacon = zbeacon_new (9999);
+zbeacon_publish (service_beacon, announcement, 2);
+[[/code]]
+
+Now, to do service lookup, we also use a beacon, but instead of publishing, we subscribe:
+
+[[code]]
+//  Create beacon to look up the service
+zbeacon_t *client_beacon = zbeacon_new (9999);
+zbeacon_subscribe (client_beacon, NULL, 0);
+
+char *ipaddress = zstr_recv (zbeacon_pipe (client_beacon));
+zframe_t *content = zframe_recv (zbeacon_pipe (client_beacon));
+int port_nbr = (zframe_data (content) [0] << 8) + zframe_data (content) [1];
+[[/code]]
+
++++ The ZRE Protocol
+
+Here's how Zyre implements its ZRE beacons, which provide a more robust protocol than simply sending a 2-byte port number into the aether. The full code is in [https://github.com/zeromq/zyre/blob/master/src/zre_node.c#L281 zre_node.c] but we can cover the highlights here. First we define the beacon as a structure that maps directly to the binary beacon data:
+
+[[code]]
+#define ZRE_DISCOVERY_PORT 5670
+#define BEACON_VERSION     0x01
+
+typedef struct {
+    byte protocol [3];
+    byte version;
+    byte uuid [ZRE_UUID_LEN];
+    uint16_t port;
+} beacon_t;
+[[/code]]
+
+And then each node sets-up a two-way beacon when it initializes:
+
+[[code]]
+//  Set broadcast/listen beacon
+beacon_t beacon;
+beacon.protocol [0] = 'Z';
+beacon.protocol [1] = 'R';
+beacon.protocol [2] = 'E';
+beacon.version = BEACON_VERSION;
+beacon.port = htons (self->port);
+self->uuid = zre_uuid_new ();
+zre_uuid_cpy (self->uuid, beacon.uuid);
+
+self->beacon = zbeacon_new (ZRE_DISCOVERY_PORT);
+zbeacon_noecho (self->beacon);
+zbeacon_publish (self->beacon, (byte *) &beacon, sizeof (beacon_t));
+zbeacon_subscribe (self->beacon, (byte *) "ZRE", 3);
+[[/code]]
+
+In our main poll loop, we poll on {{zbeacon_pipe (self->beacon)}} and when there's activity on that socket we read the beacon data:
+
+[[code]]
+//  Get IP address and beacon of peer
+char *ipaddress = zstr_recv (zbeacon_pipe (self->beacon));
+zframe_t *frame = zframe_recv (zbeacon_pipe (self->beacon));
+
+//  Ignore anything that isn't a valid beacon
+bool is_valid = true;
+beacon_t beacon;
+if (zframe_size (frame) == sizeof (beacon_t)) {
+    memcpy (&beacon, zframe_data (frame), zframe_size (frame));
+    if (beacon.version != BEACON_VERSION)
+        is_valid = false;
+}
+else
+    is_valid = false;
+
+//  Check that the peer, identified by its UUID, exists
+if (is_valid) {
+    zre_uuid_t *uuid = zre_uuid_new ();
+    zre_uuid_set (uuid, beacon.uuid);
+    zre_peer_t *peer = s_require_peer (
+        self, zre_uuid_str (uuid), ipaddress, ntohs (beacon.port));
+    zre_peer_refresh (peer);
+    zre_uuid_destroy (&uuid);
+}
+free (ipaddress);
+zframe_destroy (&frame);
+[[/code]]
+
+++ Conclusions
+
+[[size 180%]]zbeacon provides a basic service for UDP-based local network discovery that needs no central brokers and lets you build fully plug-and-play architectures.[[/size]]
+
+The zbeacon module in the [http://czmq.zeromq.org CZMQ library] provides a basic service for UDP-based local network discovery that needs no central brokers and lets you build fully plug-and-play architectures. It's simple to use. You can use zbeacon by itself, or you can go further and use the whole Zyre library, which gives you a distributed plug-and-play message bus.
+
+Can UDP-based discovery scale to billions of nodes? By itself, no. But it solves the puzzle for proximity networking, where a set of mobile devices or cloud nodes are on the same local network. This is a good building block for larger decentralized applications. We can use other discovery techniques, such as brokers, DNS, and configured endpoints to bridge together networks of local groups.

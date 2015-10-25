@@ -1,0 +1,36 @@
+While wrapping ZeroMQ's new security API up in the [http://czmq.zeromq.org high-level C binding], I accidentally a certificate format. With all respect to X.509 and existing PKI standards, the reason I built CURVE for ZeroMQ was to get simple and foolproof security. Using a complex legacy certificate format would spoil the soup. I've no idea what the right format is, but to start, I'm going to try to collect requirements.
+
+The following list is meant for discussion. Based on that, I'll edit this post into shape and come up with some proposals that we can beat into shape.
+
+++ Syntax vs. Semantics
+
+To start with, do we need a single standard file format? I think no, it doesn't matter what format a certificate is stored in, as long as it's convertible. That means consistent semantics. One name for a thing, where the name is formally defined. But whether we use JSON, XML, YAML, or hand-crafted 13-bit binary formats, does not really matter.
+
+++ Extensibility
+
+My pet mechanism for ZeroMQ is CURVE, which implements the CurveZMQ handshake. However people are already starting to design other mechanisms for ZeroMQ, which has an extensible security model. Do we want to have a new certificate discussion for every mechanism? I think it would be better to have one format that different mechanisms can reuse (if they want to, since some mechanisms will already have their own certificate formats). Since each mechanism will have its own requirements, how about an extensible certificate format?
+
+++ Metadata Headers
+
+Certificates probably need some place to store metadata, such as the name of the person who this certificate identifies, partly to make management easier, perhaps also for authentication and access control. Let's say metadata consists of a set of named properties, without hierarchy. Let's make the names case-insensitive to avoid mistakes when people type them by hand.
+
+++ Multilevel Certificates
+
+At least for CURVE, we need two certificates; a public one (metadata + public key), and a secret one (metadata + public key + secret key). For the application, this could maybe be transparent, or abstracted in some way.
+
+++ A Standard API
+
+Speaking of applications, if we have a standard certificate format for ZeroMQ applications, shouldn't we also have a standard API to work with them? That could even be embedded into the core libzmq API so that it's available to all language bindings. By "work with", I mean at least creating but also possibly parsing certificates.
+
+++ Encryption of Secret Keys
+
+Having a secret key in plain view is troublesome since it's too easy to leave a directory readable to other processes. Even if applications check that secret certificates have the right permissions, that doesn't guard against any exploit that gets root access. So perhaps we need passphrase encryption of the certificate, where the client application can prompt the user for the passphrase when starting up.
+
+++ Certificate Signing
+
+I don't see a way to safely share a certificate without some shared secret, or resorting to a third party, CA-style. Even if I encrypt the certificate with the recipient's public key, they can't authenticate that without knowing my public key in advance. Is there a simple answer to this?
+
+++ Public Infrastructure
+
+Some people will certainly build certificate servers, but do we want this to be part of the certificate design? I think that's a strong "no" since it raises the barrier for even simple cases. A certificate format should be simple for simple case.
+

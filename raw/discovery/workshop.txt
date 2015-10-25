@@ -1,0 +1,81 @@
+Presentation:
+
+- problems:
+    - number of moving pieces increases to infinity
+    - cost of knowledge must decrease to zero
+    - cost of change must decrease to zero
+    - less control from the center (BYOD)
+- solutions? ask crowd
+    - hard-coded -> change is expensive
+    - configured -> management problem
+    - message broker
+    - address broker
+    - static DNS
+    - dynamic DNS / ZeroConf
+    - system-level discovery (ARP, ICMP_ECHO)
+    - UDP broadcast/multicast
+    - brute-force discovery
+    - gossip discovery (DNS style)
+- what's a service?
+    - network endpoint? BSD socket style port?
+    - app on an endpoint?
+    - named app somewhere on service?
+    - one-of-one, one-of-many?
+
+- gross simplifications:
+    - discovery over WAN (web-scale services)
+    - discovery over LAN (peers close to you)
+
+- has to be:
+    - simple
+    - abstract (ephemeral ports)
+    - user space
+    - zero admin
+    - zero config
+    - portable
+    - wifi friendly
+    - any language
+    - snappy
+    -> only UDP does all this
+
+- demo time
+    - PUB bind to 9000
+
+static void
+sub_task (void *args, zctx_t *ctx, void *pipe)
+{
+    void *sub = zsocket_new (ctx, ZMQ_SUB);
+    int address;
+    for (address = 1; address < 255; address++) {
+        rc = zsocket_connect (sub, "tcp://192.168.55.%d:9000", address);
+        assert (rc == 0);
+    }
+    zsocket_set_subscribe (sub, "");
+    while (!zctx_interrupted) {
+        char *message = zstr_recv (sub);
+        if (message) {
+            printf ("%s", message);
+            free (message);
+        }
+    }
+}
+
+int main (void)
+{
+    zctx_t *ctx = zctx_new ();
+    
+    //  start sub thread
+    zthread_fork (ctx, sub_task, NULL);
+
+    void *pub = zsocket_new (ctx, ZMQ_PUB);
+    zsocket_bind (pub, "tcp://*:9000");
+    while (!zctx_interrupted) {
+        char message [1024];
+        if (!fgets (message, 1024, stdin))
+            break;
+        zstr_send (pub, "pieter: %s", message);
+    }
+    zctx_destroy (&ctx);
+    return 0;
+}
+    

@@ -1,0 +1,47 @@
+++ Over and Under
+
+Many teams have already built strong security on top of ZeroMQ, and you may ask why it's better to use the built-in security rather than building your own layered security on top. After all, libraries like libsodium make it surprisingly easy to encrypt and decrypt data.
+
+There is one argument for making layered security instead of the built-in CURVE mechanism, which is that if CURVE turns out to have a vulnerability, anyone using it is exposed, while anyone using layered security won't be.
+
+Against that, we have the advantages of putting strong encryption into the ZeroMQ wire protocol where we all share the risk:
+
+* The CURVE mechanism is [http://curvezmq.org explicitly documented], in a series of RFCs, so it is open to review, critique, and improvement. This is the number one requirement of any security I'd trust.
+
+* It works for all socket types, even one-way sockets like PUSH-PULL and PUB-SUB, whereas layered security will only work across ROUTER-DEALER flows, or some hybrid of request-reply and one-way sockets.
+
+* It uses the security handshake from [http://curvecp.org CurveCP], which gives us perfect forward security (PFS) among other things. CurveCP was designed, like Curve25519, by Daniel Bernstein.
+
+* It is considerably simpler and cheaper to use, while being (in theory) the most expensive model to break. PFS is not easy to implement, so layered security will usually not do that, and simply use long-term public/private key pairs.
+
+
+++ The Helicopter Guidebook
+
+The one thing about security is how fast it gets complex. When I designed ZeroMQ's security model and CURVE mechanism I really did my best to keep things simple, and if you know my work on APIs and protocols, you might appreciate this. But nonetheless, every concept takes mental effort to learn. There's no shortcut to learning them, but to reduce the pain, I'm going to list all the inhabitants of ZeroMQ's security zone and explain what each one does, where it came from, why you might want to learn more, and where you can learn more if you need to.
+
+
+CurveCP
+ECC
+Curve25516
+Public key
+Secret key
+Permanent keypair
+Transient keypair
+Server key
+Client key
+Certificate
+Certificate store
+ZAP
+ZMTP
+CurveZMQ
+Libcurve
+Libsodium
+NaCl
+Domain
+Mechanism
+NULL
+PLAIN
+CURVE
+Whitelist
+Blacklist
+

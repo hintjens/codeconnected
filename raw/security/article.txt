@@ -1,0 +1,106 @@
+First Steps with CurveCP
+
+One of the biggest user requests for ØMQ is a good security layer. Mainstream options like TLS/SSL are complex, slow and designed for web browsing, not high-speed messaging. In this article I'll present [http://curvecp.org CurveCP], one of the most exciting security developments in recent years. It's part of the [http://nacl.cr.yp.to NaCl] networking and cryptography library and looks perfectly suited to ØMQ. To demonstrate this, I've made a [https://gist.github.com/hintjens/5137685 "Hello World" proof of concept] that shows an authenticated, confidential connection from one client to one server, over ØMQ.
+
+++ What's Special About CurveCP and NaCl?
+
+NaCl, the lower-level library, is the ØMQ of security libraries. It has two outstanding features. One, it's very fast. Two, it has a simple API that hides everything except literally what you need to encrypt and decrypt data. Security is not an easy subject but NaCl makes it as easy as I've ever seen. Hiding the algorithms means as a developer I can't get it wrong. The site says:
+
+> The following report specifies NaCl's default mechanism for public-key authenticated encryption, and along the way specifies NaCl's default mechanisms for scalar multiplication (Curve25519), secret-key authenticated encryption, secret-key encryption (Salsa20), and one-time authentication (Poly1305): (PDF) Daniel J. Bernstein, "Cryptography in NaCl", 45pp.
+
+A simple [https://gist.github.com/hintjens/5137671 encryption/decryption test] shows I can do 1.4M encryptions or 750K decryptions per second. This is of a short text but it's still impressive.
+
+Now CurveCP, which is packaged with NaCl. This is quite the beast! It's not just a security layer, it's a full replacement for TCP and includes a full protocol client and server. The interesting thing for us ØMQ programmers is how CurveCP steps aside from TCP's connection model, and creates its own logical, secured connections over UDP. It's interesting because ØMQ acts more like UDP - with its 'best effort' message-based approach - than TCP.
+
+There is one "gotcha" with CurveCP, you have to handle your own key distribution. Peers have to know each others' public keys in advance. This is a challenge we'll solve later. CurveCP is asymmetric, so a peer is either a "client" or a "server". Nothing unusual here. The freaky part (which I appreciate) is how carefully Daniel J.Bernstein, the mathematician, cryptologist, and programmer behind this animal has designed it to stand up to a range of attacks.
+
+CurveCP authenticates servers and clients, stops replay and man-in-the-middle attacks, and provides active and passive forward secrecy, which means even if you capture traffic, you can't do anything with it. The client's long-term public key is safe from snoopers: connections use short-term keys.
+
+The list of goodies goes on: CurveCP is a fully disconnected protocol. So a client can move around and switch IP addresses and continue to work. It's route independent: any connection, any transport, any intermediaries. If you're a ØMQ developer you should be drooling by now. This is sexy stuff! 
+
+So CurveCP looks really attractive. Next question, can we use it for ØMQ dialogues, and if so, how?
+
+++ Taking CurveCP Apart
+
+As provided, CurveCP is really two things. One, a set of specifications for the protocol, and second, an implementation of the client and server. The protocol isn't a single document like an RFC but a set of web pages. It's immediately clear that DJB has bitten off rather a lot with CurveCP. There's no layering. My mind reels as I read the protocol description and then the source code. It's C, but barely comprehensible.
+
+There's no way I can see to use the CurveCP implementation, not any of the source code, nor the protocol as-is, for anything ØMQ-related.
+
+Luckily Grant Rodgers, who works at GitHub (I think), wrote [https://gist.github.com/grantr/4757832 a Ruby implementation] of just the CurveCP handshake. This is a great tutorial for the inner workings of CurveCP's security. The Ruby code uses some functions from [https://github.com/cryptosphere/rbnacl RbNaCl] so I ended up reading that code too.
+
+ØMQ has many echoes of UDP, with its disconnected message passing so it seemed natural to build a CurveCP handshake above ØMQ. The handshake is pretty simple (at the surface):
+
+* Client sends HELLO
+* Server sends COOKIE
+* Client sends INITIATE
+* Server sends 0 or more MESSAGEs
+* Client sends 0 or more MESSAGEs
+
+The hard work is in the details of each command but to be honest, except for the boring business of pushing bytes around and managing various sets of keys, and making some good choices, it's quite straight-forward. The [https://gist.github.com/hintjens/5137685 code is about 450 lines] and I've made no attempt to create abstractions. This is a straight unfolded step-by-step implementation.
+
+When I run this, it does a handshake and a "Hello World" exchange:
+
+[[code]]
+C:HELLO: OK
+S:COOKIE: OK
+C:INITIATE: (host=localhost) OK
+C:MESSAGE: (request=Hello) OK
+S:MESSAGE: (reply=World) OK
+-> 'Hello World' test successful
+[[/code]]
+
+++ Installing NaCl
+
+If you want to try the PoC you'll have to install NaCl. Here's how I did this on my Linux box. First we build the library:
+
+[[code]]
+wget http://hyperelliptic.org/nacl/nacl-20110221.tar.bz2
+bunzip2 < nacl-20110221.tar.bz2 | tar -xf -
+cd nacl-20110221
+./do
+[[/code]]
+
+Then we install into /usr/local:
+
+[[code]]
+cd build/myboxname
+sudo cp include/amd64/*.h /usr/local/include
+cd lib/amd64
+ar r libnacl.a randombytes.o
+sudo cp libnacl.a /usr/local/lib
+cd ../..
+sudo cp bin/amd64/bin/curve* /usr/local/bin
+cd ../..
+[[/code]]
+
+++ Details of the Proof-of-Concept
+
+Though CurveCP hides the dirty choices of what primitives to use, we need to choose good "nonces". A nonce is a "number used once" and it's the caller that has to provide these. If you reuse the same nonce, you're effectively opening a crack that will leak data and/or public keys.
+
+CurveCP uses two kinds of nonces:
+
+* Long-term nonces (16 bytes), used with the client and server long-term keys. The website describes a few strategies for choosing these. In the proof-of-concept I used random bytes from /dev/random. This is the simplest option and the chance of duplicate nonces is so low that at this stage, that's the choice I'll keep for real code.
+
+* Short-term nonces (8 bytes), used with short-term keys (CurveCP uses a new key set for each connection). These are just incrementing 64-bit integers, which even I can produce.
+
+The CurveCP INITIATE command in theory can carry a message (that is, user data). I didn't implement this for the example. Instead the client sends INITIATE and then immediately a MESSAGE carrying the "Hello" string.
+
+The PoC also sends fixed-sized MESSAGE commands but this is just to keep it simple. In reality we'd want variable length MESSAGE commands.
+
+The PoC is filled with magic numbers like the sizes of keys (32 bytes), nonces (24 bytes) and so on. This sucks but it seems unavoidable at least for now.
+
+++ Next Steps
+
+The code needs packaging; there's a lot of repetition and I'd like to turn this into a CZMQ-like module. The CurveCP handshake can be fully hidden. It could maybe look like SASL, that is, a client and server exchanging opaque blobs until they're satisfied (or they break the connection).
+
+In the [https://github.com/zeromq/filemq FileMQ project] I used SASL for security, and CurveCP seems like a perfect fit into that. So that'll be my next step: secure file transfer.
+
+At this stage the rest is just ideas. But I'd like to experiment with multiple routes between clients and servers. So, for instance, start a secure connection over DEALER-ROUTER, then continue it over PUB-SUB. If we can create a nice module, it could go into CZMQ so it becomes available to a wide set of developers.
+
+Then, key distribution. I'm thinking, the Clone pattern from Chapter 5 of the Guide, combined with CurveCP security.
+
+I'd also like to make a proper RFC for CurveCP-derived security over ØMQ. What I implemented in the PoC //isn't// the CurveCP protocol, it's a subset of that. For example there are no //extensions//, and the MESSAGE command lacks all the flow-control fields. This needs to be documented so that other people (e.g. Ruby programmers who are lucky enough to have RbNaCl) can make interoperable code.
+
+++ Conclusions
+
+ØMQ doesn't play nicely with the old-fashioned connected security model of TLS/SSL. Luckily there's something better in the shape of CurveCP, a fast peer-to-peer security layer that promises authentication and confidentiality, speed, and simplicity. I've written a [https://gist.github.com/hintjens/5137685 simple proof-of-concept] that demonstrates the CurveCP handshake running over ØMQ.

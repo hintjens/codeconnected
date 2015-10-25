@@ -1,0 +1,181 @@
+This week, we flesh out the basics of our CurveCP-derived protocol, with an implementation in C that I'm calling CurveZMQ. In this article I'll explain what this simple but powerful security protocol looks like. The code here will already work over 0MQ sockets but our next stage is to move this into libzmq itself, for all sockets over {{@@tcp://@@}} and {{@@ipc://@@}}. So stay tuned!
+
+++ Overview of CurveZMQ
+
+[https://gist.github.com/hintjens/5224958 The CurveZMQ code] uses the [http://rfc.zeromq.org/spec:21 CLASS] conventions which make the C code look like something nicer. Here's the self-test code, which sends "Hello" and expects "World" back. CurveZMQ uses a single module, {{zcurve}}:
+
+[[code]]
+zmq_msg_t *msg;
+
+//  Start server peer
+zcurve_t *server = zcurve_new ();
+msg = zcurve_start (server, NULL);
+assert (msg == NULL);
+
+//  Start client peer and ping/pong through the handshake
+zcurve_t *client = zcurve_new ();
+msg = zcurve_start (client, zcurve_public_key (server));
+while (msg) {
+
+    //  Send encoded message from client to server
+    //  ...
+    //  Receive encoded message in server
+    
+    msg = zcurve_accept (server, msg);
+    if (msg)
+    
+        //  Send encoded message from server to client
+        //  ...
+        //  Receive encoded message in client
+        
+        msg = zcurve_accept (client, msg);
+}
+msg = zcurve_encode (client, (byte *) "Hello", 5);
+assert (msg);
+
+//  Send encoded message over the wire
+//  ...
+//  Receive encoded message from the wire
+
+msg = zcurve_accept (server, msg);
+assert (msg);
+assert (memcmp (zmq_msg_data (msg), "Hello", 5) == 0);
+
+msg = zcurve_encode (server, (byte *) "World", 5);
+assert (msg);
+
+//  Send encoded message over the wire
+//  ...
+//  Receive encoded message from the wire
+
+msg = zcurve_accept (client, msg);
+assert (msg);
+assert (memcmp (zmq_msg_data (msg), "World", 5) == 0);
+
+zcurve_destroy (&server);
+zcurve_destroy (&client);
+[[/code]]
+
+We work with two zcurve instances; one acts as client and one as server. In practice you'd create a zcurve instance for each 1-to-1 connection. The security protocol, which I'll explain, assumes that the underlying transport is TCP. There's an easy tweak to make this work over disconnected protocols (PGM, UDP, or even non-network protocols like shared disk). But since that isn't our use case, I'll explain the tweak and then forget about it.
+
+The zcurve API reminds us a little of SASL, with its "I'll consume and produce opaque blobs until I'm satisfied". The blobs in our case are 0MQ messages. In the test code above we don't send them anywhere, we simply pass them between two zcurve instances until the handshaking is done. There are three critical methods in the API:
+
+* {{zcurve_start ()}} - which starts the state machine and may issue a challenge command.
+* {{zcurve_accept ()}} - which accepts a command and may issue a response.
+* {{zcurve_encode ()}} - which turns a plain text payload into an encoded blob.
+
+In fact the API still needs work: right now the accept method's response message does double duty. If we're still handshaking, it has to go back to the peer. If we're finished hand-shaking, it's a decoded payload. I'll fix this in the next prototype.
+
+But one step at a time. //Don't make stuff you don't need.// This brings me to the CurveZMQ protocol, which is derived from [http://curvecp.org the CurveCP handshake] and uses the same concepts like cookies, nonces, and vouches, but is simpler. The original CurveCP handshake is designed for UDP and includes a variety of non-security related features like virtual hosts. Trimming off this and other unnecessary fields gives us a minimal Curve-derived protocol.
+
+The zcurve module uses a state machine to decide what's valid and what's not. In this prototype, anything invalid causes an assertion failure. It is not meant to be production code, yet. In practice invalid messages will cause the connection to be dropped.
+
+++ Building and Testing
+
+To build this you first want to install and build [https://github.com/jedisct1/libsodium libsodium]. Use the standard commands:
+
+[[code]]
+./configure
+make && make check && make install
+[[/code]]
+
+You also want libzmq and CZMQ. Then take [https://gist.github.com/hintjens/5224958 the CurveZMQ code from the gist] and compile and link zcurve_test:
+
+[[code]]
+git clone https://gist.github.com/5224958.git CurveZMQ
+cd CurveZMQ
+gcc -g -o zcurve_test zcurve_test.c zcurve.c -lczmq -lzmq -lsodium
+[[/code]]
+
+And run the test program:
+
+[[code]]
+$ ./zcurve_test
+Running self tests...
+ * zcurve: C:HELLO: OK
+S:COOKIE: OK
+C:INITIATE: OK
+-:MESSAGE: OK
+-:MESSAGE: OK
+Tests passed OK
+[[/code]]
+
+++ Security Models
+
+CurveZMQ allows three possible security models:
+
+* Anonymous clients, known server: where the server key is known to clients, but the server does not validate client keys.
+* Pre-shared clients, known server: where the server key is known to clients, and all clients share a single key.
+* Fully authenticated: where the full set of allowed clients is known to the server.
+
+We don't yet have a hook in zcurve to authenticate a client; it would be trivial to add, e.g. using a callback that checks a given client long-term public key.
+
+++ Differences between CurveZMQ and the CurveCP Handshake
+
+To understand this section you should at least briefly read [http://curvecp.org the CurveCP website] and protocol description.
+
+While CurveCP runs over UDP and uses a number of techniques to harden the server (such as not allocating memory until the client has successfully echoed a cookie), CurveZMQ runs over a connected transport (TCP or IPC) and cannot use, and does not need all the functionality of CurveCP:
+
+* //We do not use a minute key for cookies//; instead, each connection creates a unique cookie key which is valid until the client sends an INITIATE command. The server could also check that INITIATE comes within 60 seconds of HELLO.
+
+* //We do not send the client short-term key in MESSAGE commands//. This would be useful over disconnected transports but for our use case, TCP and IPC, it's pointless. If we added that, we'd add it both for client and server MESSAGE commands, so that clients could work with multiple servers.
+
+* For simplicity, //INITIATE does not contain message data.//
+
+* Thus, //server and client MESSAGE commands have the same structure// and are the only carriers for payloads.
+
+* //We don't have a hostname in the INITIATE command.//
+
+And we don't use any of the CurveCP traffic control protocol fields. CurveZMQ assumes a reliable connected transport.
+
+The current CurveZMQ prototype still uses a fixed message size, maximum of 100 bytes. The next iteration will need variable message encoding. There are a number of other simplifications that are more or less safe:
+
+* //Long term server nonces are not segregated// but we'd want to do this in practice: start the server nonce at a random number and then increment by 1.
+
+* //Short term nonces are always generated from random numbers.// The chance of a collision is low enough that this is robust for production use.
+
+++ CurveZMQ Internals
+
+Here are the command structures we use. I'll document the detailed specification of each field later; the CurveCP website does explain them already:
+
+[[code]]
+typedef struct {
+    byte id [8];                //  Command ID
+    byte cn_client [32];        //  Client short-term public key C'
+    byte cn_nonce [8];          //  Client short-term nonce
+    byte box [80];              //  Box [64 * %x0](C'->S)
+    byte padding [64];          //  Anti-amplification padding
+} c_hello_t;
+
+typedef struct {
+    byte id [8];                //  Command ID
+    byte nonce [16];            //  Server long-term nonce
+    byte box [144];             //  Box [S' + cookie](C'->S)
+} s_cookie_t;
+
+typedef struct {
+    byte id [8];                //  Command ID
+    byte cn_client [32];        //  Client short-term public key C'
+    byte cn_cookie [96];        //  Server connection cookie
+    byte cn_nonce [8];          //  Client short-term nonce
+    byte box [112];             //  Box [C + nonce + vouch](C'->S')
+} c_initiate_t;
+
+typedef struct {
+    byte id [8];                //  Command ID
+    byte cn_nonce [8];          //  Server short-term nonce
+    byte box [116];             //  Box [M](A'->B') (from A to B)
+} cs_message_t;
+[[/code]]
+
+The flow is quite simple:
+
+* Client sends a HELLO command to server
+* Server responds with a COOKIE command
+* Client responds with an INITIATE command
+* Client can now send MESSAGE commands
+* When server receives the INITIATE command, it can send messages.
+
+++ Next Steps
+
+As next step we'll implement CurveZMQ in the libzmq core and document the protocol properly as an RFC. The C implementation will act as a reference implementation for the protocol.

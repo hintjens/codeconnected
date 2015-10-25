@@ -1,0 +1,91 @@
+Securing ZeroMQ: Testing libsodium
+
+Marc Falzon (@falzm) pointed me to libsodium, a repackaging of the NaCl library. The Sodium README says that it's, "tested on a variety of compilers and operating systems, including Windows, iOS and Android," and "tests and benchmarks will be performed at run-time, so that the same binary package can still run everywhere." This fixes the biggest problem with NaCl, which is that it optimizes at compile-time, so you can't ship it in binaries. Today I tried Sodium, and here are the results of my tests.
+
+The short story is: //libsodium delivers//. This is the library I want to build ØMQ security on.
+
+There's so much to like about Sodium and only one downside that I'll come to. The project lives on GitHub so I forked and cloned it. It uses autotools, so builds just like all our projects do:
+
+[[code]]
+./autogen.sh
+./configure
+make && make check && make install
+[[/code]]
+
+This will make it easy to integrate into FileMQ or CZMQ when the time comes. When I recall how difficult it used to be to build OpenSSL, this is gratifying. Autotools may be one of the least friendly toolsets ever but it's established a standard for C library projects that //just works//.
+
+So I cleaned out my NaCl installation and installed Sodium. Sodium uses the same approach as CZMQ and libzmq, which is to provide a single header file ({{sodium.h}}) for the whole library. Awesome!
+
+Allow me a little rant. When you make a library, please do like Sodium does, and export a single header file. Why give the user extra work with no benefit? The old technique of "if you want functionality X, include header file Y" was a great idea in 1970 when compilers took minutes per file, but is pathological in 2013.
+
+When I include {{czmq.h}} in a program, that pulls in several dozens of the commonly-used system header files as well as the whole CZMQ interface. It adds about 0.1 seconds to a compilation. Even in 1990 when this trick added 2-3 seconds, this was a good trade-off because it gave me simpler, more consistent code.
+
+//It's very poor practice to start a C source file with a bunch of includes.// Libzmq does this and it's been a source of error and confusion. "Oh yes, you have to include {{winsock.h}} but //after// that other file, otherwise you get a bad definition for the maximum sockets." Bleh. Create a project header file that sets-up the whole compile environment for you and then include that in each source.
+
+And export your API as one header file, please. </rant>
+
+So here's a minimal Sodium example:
+
+[[code]]
+#include <czmq.h>
+#include <sodium.h>
+
+int
+main (void)
+{
+    byte public_key [crypto_box_PUBLICKEYBYTES];
+    byte secret_key [crypto_box_SECRETKEYBYTES];
+    int rc = crypto_box_keypair (public_key, secret_key);
+    assert (rc == 0);
+    return 0;
+}
+[[/code]]
+
+Here's the next thing I love about Sodium: //it is 100% compatible with the NaCl API.// Not 80%, or 99%, but literally one hundred percent. It's hard to express the joy this gave me as a developer. NaCl's API is one of those "love at first sight" things. This is the gold standard for everyone building APIs: stick to the contracts, resist the temptation to screw over your users in the name of "doing it better this time". Try designing the API right the first time around, maybe?
+
+Now, language bindings. Sodium reports two bindings, PyNaCl and RbNaCl. This means any design I make using Sodium will be easy to re-implement in PyZMQ and in rbzmq. Yay!
+
+It was literally 30 seconds' work to change, recompile, and retest my zcurve proof-of-concept. It helps that I use a [https://gist.github.com/hintjens/5141852 helper script called "c"] that does smart things like searching /usr/local/lib for all libraries:
+
+[[code]]
+~/work/zcurve$ c -l zcurve-poc
+Compiling zcurve-poc...
+Linking zcurve-poc...
+~/work/zcurve$ ./zcurve-poc
+C:HELLO: OK
+S:COOKIE: OK
+C:INITIATE: (host=localhost) OK
+C:MESSAGE: (request=Hello) OK
+S:MESSAGE: (reply=World) OK
+-> 'Hello World' test successful
+[[/code]]
+
+Now, performance testing. Here's the performance I was getting from NaCl, compiled specifically for my AMD64 CPU:
+
+[[code]]
+One-step box:
+Encryptions: 6400/second
+Decryptions: 6400/second
+Two-step box:
+Encryptions: 1449300/second
+Decryptions: 762600/second
+[[/code]]
+
+The one-step box does a hashed key exchange and then does an encryption using the resulting key. The key exchange is slow, so NaCl lets you do this in two steps: do the key exchange once, and the encryption repeatedly (using a different nonce each time). That gives the second result.
+
+Now here are the figures for Sodium:
+
+[[code]]
+One-step box:
+Encryptions: 300/second
+Decryptions: 300/second
+Two-step box:
+Encryptions: 733400/second
+Decryptions: 488800/second
+[[/code]]
+
+The lesson is clear: //don't use single-step encryption// unless you're really doing a one-off (as in the start of the CurveCP handshake). The two-step encryption is about half the speed of NaCl's optimized code. The Sodium team know that performance is a concern, and they say:
+
+>Optimized implementations (including NEON optimizations) will eventually be supported, but tests and benchmarks will be performed at run-time, so that the same binary package can still run everywhere.
+
+They've gotten it right: clean packaging and portability is more important than raw performance. It'll take a few years for Sodium to replace OpenSSL as the security library of choice and by that time, there will be enough people using it to make optimizations worthwhile.

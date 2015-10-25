@@ -1,0 +1,186 @@
+Software version numbers are the crack cocaine of change management. They are an easy and attractive path to serious long term stress and pain. The worst ever distress in the ZeroMQ community came from allowing library version numbers to define compatibility. The reasons are real, yet subtle and often counter-intuitive. In this blog I'll explain in detail, and propose a replacement for software versioning.
+
+[[toc]]
+
+++ The Economics of Contracts
+
+In this section I'll explain why we need contracts and standards in software.
+
+Definitions first: a "software contract" is an API, or a protocol, or some other formalized interaction that allows two otherwise unconnected components of a system to work together. I've written a lot about contracts, because they are so vital to making successful distributed software. Contracts let us build overall systems in parallel, in many places and at many times, and with many teams. However, contracts are a vital concept in all types of software.
+
+All libraries and products implement contracts, explicit or implicit. Contracts may be documented (using formal prose like RFCs, ideally), or embedded in code (less than ideal). A contract may have multiple independent and competing implementations, and the more implementations, the better.
+
+In ZeroMQ we have wire-protocol contracts like the [http://rfc.zeromq.org/spec:23 ZMTP protocol] and [http://rfc.zeromq.org/spec:26/CURVEZMQ CurveZMQ security protocol], and the semantics of various socket patterns. We also have contracts for the API, specified as man pages.
+
+When a contract is written and published by third parties, it becomes a standard.
+
+The economics of standards are simple: they enable competition between suppliers, and this drives down the cost of products. Suppliers have an incentive to keep contracts undocumented, over-complex, hard to implement, or even proprietary. Customers have an incentive to turn contracts into standards, to simplify them, make them easier to implement, and bring the cost of knowledge to zero.
+
+In markets where standards are properly regulated to remain free and open, the cost of goods does fall as it should. In markets where prices are not falling, the cause is generally lack of competition, enabled by closed, complex, or undocumented contracts. Free and open standards promote a competitive free market, whereas captive standards or captive contracts raise costs.
+
+This is how it works in large-scale real world economies, and it is also how it works in software projects, which emulate economies (often they emulate an insane centrally planned economy, though [http://hintjens.com/blog:74 that is another story]).
+
+In any software project, even an open source one, the incentives of competition and capture are present, even if Euros and Dollars aren't literally on the table. We are all Comcast, at times. When you're choosing a software stack, your primary questions should be, "does this stack implement public contracts?" and then, "who else implements these same contracts and are they standards?"
+
+A contract needs several properties to work as a real public standard. Above all, it must be published, and it must be freely remixable (to prevent capture). The more we tend to formal processes and organizational ownership, the more it costs to make a contract, and the more vulnerable it is to capture.
+
+So ideal public contracts are owned collectively, and published centrally only for convenience. Every project and product must be free to define its own contracts, either new ones, or remixes of existing works. These contracts should move, over time, towards stability and acceptance as standards by the market (if they are successful), or else should die and disappear.
+
+++ The Problem With Software Versions
+
+In this section I'll try to nullify the dominant theory of software versions.
+
+The worst times in ZeroMQ's history were when we changed the library version to signal major and incompatible change in its contracts. Version 2.0 did not talk to version 3.0, which did not talk to (the then) 4.0. They had incompatible protocols and different APIs. These were in effect different products, each trying to define its own private (and poorly documented) contracts.
+
+To fix this problem, we introduced the rule that new stable releases of the software must (a) talk to old stable releases and (b) they must support existing apps, without changes. We more or less succeeded with that, so ZeroMQ versions 3.2 and 4.0 work nicely with 2.2 and 2.1, for example. We slipped only once or twice, by shipping a stable release with new contracts that turned out to have flaws which needed fixing.
+
+Initially, this rule made it harder to make stable releases, as the size and reach of the ZeroMQ contracts grew. Yet by moving to a [http://rfc.zeromq.org/spec:22 more organic process] we found that our master branch was stable most of the time. Banning breaking changes had the effect of reducing the impact of errors. Fewer large changes means fewer bugs in released code. Today, we make stable releases of core ZeroMQ projects like CZMQ by tagging master.
+
+If you look at libzmq (the original "ZeroMQ"), you'll see [https://github.com/zeromq/libzmq/blob/master/include/zmq.h a single header file] that defines the API contract. This is the most significant to most users, since it is what they write code against. If you read that file, you'll see it is rather chaotic and unstructured. It ends in an "undocumented" section marked "use at your own risk".
+
+There is no ZeroMQ "team". Change to the code base (in all ZeroMQ projects that use our C4.1 process) is driven by a distributed process that collects real world problems from users, prioritizes them, estimates their importance, and then rapidly tests solutions against them until an acceptable solution emerges. The emphasis is on low latency and accuracy.
+
+Since change is driven by use, as a product gets wider use, change also hits a wider front. We're not talking deep, dramatic shifts (though [http://hintjens.com/blog:84 some threads] may sound like that). Rather, we're talking about tiny evolutionary changes happening in many areas.
+
+Change to a system creates shifts in knowledge and costs, resulting in "vertical tipping points". This is when a series of answers to a whole set of problems can suddenly be recast as a new model, with new abstractions that hide much or all of the complexity that has grown up.
+
+For example in ZeroMQ, to make a workable client-server pattern, you take DEALER and ROUTER sockets, configure them in various ways, add heartbeating and sessions and timeouts, and perhaps discovery. We start to see that this pattern happens over and over again. And suddenly we hit a tipping point where it makes sense to design "server" and "client" classes.
+
+We accumulate change horizontally, and then we refactor vertically. This is a classic and effective pattern for building software systems. The outcome is, however, that the library is never really stable, and never finished as long as people are using it in new applications.
+
+This seems nightmarish, and yet it is not. The trick is to understand two things. First, changes are naturally localized. Even if zmq.h looks like one long contract, it really covers several different areas. And these areas each have their natural cycle through experimentation to stability.
+
+Here is the key understanding: **a real product has multiple contracts, that change independently**. Take [http://api.zeromq.org/czmq3-0:_start CZMQ], which  has a better-designed API than libzmq. This library has about 40 classes, each with its own contract.
+
+When we claim "version X is stable", we are claiming either "all contracts in version X are stable". In the reality of popular products, the only way to guarantee this is to lock all contracts into synchronization, by force.
+
+From our experience, we want a decentralized, lock-free development process. That has proven to be the fastest, most accurate, and most enjoyable way to work. This process is incompatible with coercive synchronization of all the contracts in a widely used product. Thus, it is incompatible with software versions.
+
+Since every distributor insists on stable versions of code, there are of course answers to this puzzle. One is to reduce the size of products so they do implement only one contract, which can be coerced into stability. We get an explosion of libraries (we'd need 40 to cover CZMQ), and we start to depend on power and force for our work (something that's both distasteful and from experience, unproductive). "You cannot make this patch because we're making a stable release" is a failure, IMHO.
+
+Before I explain another answer that does not depend on coercion or fragmentation, let's recap what we really want to achieve (apart from making packagers and Enterprise customers happy):
+
+* We want a real-time pipeline connecting our software economy, so problems flow in one direction, and answers in the other. Annual releases just don't cut it. We want real-time, continuous delivery of small, incremental patches.
+
+* We want **guaranteed**, testable backwards compatibility with stable contracts. I'd love to be testing libzmq master against the test cases from older stable releases.
+
+* We want freedom to refactor vertically **at any time** and without upfront coordination. This means creating and delivering (so, testing) new contracts at any time.
+
+* We want a coercion-free process where power is used only to regulate contracts and cheats. This is essential to get scale. Upfront coordination is the mutex of software development.
+
+OK, we probably want a lot more than this, however it's a good list to work with.
+
+++ Contract Life-Cycles
+
+The first step to enlightenment is to see that contracts have a life-cycle. This applies to all contracts, both in software and in the real world. The contract life-cycle is not an invention, it's a feature of real world economics, and a useful one for software engineering.
+
+Public contracts most definitely change over time. Changes are not always backwards compatible. I cannot plug a horse into the house electricity mains. My 3/4" flat-headed screw does not fit the 1/2" hole in the wall. If I plug a 110V US toaster into my 220V kitchen in Brussels, the toaster dies rapidly and dramatically.
+
+Do I care what version the toaster is? No. Do I care what contracts it implements? Most definitely so. These are written in bold on the packaging, and those claims are wrong, I can sue the distributor and manufacturer for fraud.
+
+To be of general use, a standards must be stable. Of course there can be variation. I can plug a 220V toaster into a 210V, 220V, 230V, or even a 240V circuit without risk. Standards can have variations, as long as these are compatible with stable versions. This goes one way: we do not usually update shipped products over time, as standards change.
+
+How do we know when a contract is stable enough to qualify as a "standard" then? Well, for public contracts (the ones we care about and strive to make), stability is a negotiated peace between users (clients) and suppliers. Change can lower costs, yet can also create costs as the contract affects more points. So eventually the cost/benefit trade-offs drive both sides to agree that change now stops.
+
+If you look at the CZMQ classes, you'll see some are marked "deprecated". If you look at [http://rfc.zeromq.org/ the ZeroMQ RFCs], you'll see more elaborate tagging.
+
+The life-cycle of a contract can be obfuscated, by not documenting it. Let's assume our contracts are written down, not embedded in the software somewhere.
+
+A new contract usually has no implementations. Until someone signs a contract (demonstrates it in code), it's just speculation. I call these "raw" contracts. Since no-one is using a raw contract, and it's usually incomplete and immature, it changes a lot, without hurting anyone.
+
+When you can demonstrate a contract in code, it gets some status. I call these "draft" contracts. A draft contract will change a lot, often in tandem with its implementation. This is fine, and hurts no-one.
+
+When two or more parties implement a contract, and especially when there are third parties depending on the contract, however, things get serious. I call these "stable" contracts. Change to stable contracts needs upfront agreement. You cannot rely on this, except in young stable contracts with few users.
+
+Eventually a stable contract gets replaced by new draft contracts. I call these "legacy" contracts. Changing legacy contracts is just an all-round bad idea. Finally, when new stable contracts emerge, the old ones become "retired".
+
+Sometimes, new stable versions of a contract can talk to older legacy versions. Alternatively, software may implement both older and new versions of a contract.
+
+There are three key points here:
+
+* A realistic software system will implement many contracts, rather than just a single one. Whether or not these contracts are documented, a successful software system will, over time, add more and more contracts to the set it implements.
+* Each of these contracts goes through a draft-stable-legacy-retired life-cycle, which can be less or more formally defined.
+* While the life cycles of the different contracts may drive each other, they are naturally independent. To force all contracts in a system to the same state requires significant coercion and cost.
+
+Hopefully you see why trying to force an entire product into one state does not scale well.
+
+++ Defining Interoperability
+
+Interoperability is the ability of products X and Y to work together. My WiFi router has a list of USB 3G modems it works with. This seems good, right? Actually, no, it's a rubbish approach. It's like saying, "this toaster is compatible with versions 3.1 and later of my home".
+
+To define interoperability as a relationship between products is to assume that the set of products is limited and testable, and exists only within a given time and space. Yet real systems stretch over space and time. When I build a house, I equip it slowly, over years. The process of improving it never stops. The only way I can get the right toasters at the right price is to search widely and slowly (i.e. over space and time).
+
+It's far better to say, "my house has a 16A 220V-50Hz electric circuit" and "this toaster draws 4A at 220V-50Hz". That is, to define an electricity contract, and then define interoperability as "respects this contract". The supply of toasters that implement that contract is huge. The supply of toasters that implement House V3.1 is small, if not tiny to the point of "only a Russian billionaire would consider this."
+
+A list of "compatible devices" is a red flag that tells us, "this area is not standardized and thus you can expect to pay many times what you should."
+
+Ditto for software. When you install a software product you are making a long term investment. The accounting of that decision depends on the contracts the software respects. It is interesting to know what's inside the software, for sure. Is it fast, does it crash often, can it handle many users? However it's far more interesting to know what standards it implements, and how well.
+
+Software systems [http://en.wikipedia.org/wiki/Systemd that do not respect and promote public contracts] create a sense of unease and disquiet. It does not really matter whether they're open source or not. Technically and economically, the alternative to an architecture based on contracts is one based on coercion.
+
+I believe that in removing the concept of software versions, and focusing instead on the contracts that a system implements, we can get a more accurate description of what we are getting, as consumers. Further, it's a description that is mechanically testable, and could even be held up as a legally binding statement by software producers.
+
+++ The Software Bill of Materials (SBOM)
+
+Let me introduce the Software Bill of Materials, or SBOM. The SBOM is a testable statement of the contracts (e.g. RFCs) that a software product implements. The SBOM is a claim of backwards and forwards interoperability with other products, based those product's own SBOMs, rather than product version numbers.
+
+To implement an SBOM, a software project has a section in its README that says, for instance:
+
+[[code]]
+## Software Bill of Materials
+
+This software implements the following public contracts:
+
+* project/contract/name/state
+* ...
+[[/code]]
+
+If an implementation supports several versions of a contract, it should list them all. Thus libzmq, for example, implements ZeroMQ RFCs 13, 15, and 23 (three versions of ZMTP).
+
+This may seem optimistic, yet the goal should be that the SBOM defines *fully* the behavior of the software system as far as it affects other software. As in any product, there will be design trade-offs, e.g. performance vs. resource consumption. If these are relevant to the outside world, they should be defined as public contracts.
+
+The SBOM depends on a very cheap, fast way to develop RFCs through their life-cycle. I developed and tested this starting with the [http://digistan.org Digital Standards Organization] (Digistan) in 2005, and then with ZeroMQ RFCs up to the present day.
+
+An RFC is simply a contract that's published on a public platform. Under the Digistan rules, such documents use the GPLv3 license, so can be freely forked and improved. This solves the problem of capture ("No, I won't improve my RFC to make it easier for you to implement").
+
+We've additionally been using man pages as contracts for APIs, and this works up to a point. Both libzmq and CZMQ as well as other projects do this. It is however too easy to change the contract together with the software, and break existing applications.
+
+++ Long Live Version Numbers!
+
+In ZeroMQ we still use version numbers for two main reasons:
+
+* We don't have fully testable or tested contracts, and so code on master still has faults that emerge over time. We reduce the risk by forking master to a separate repository and slowly fixing this, without taking new functionality from master. This emerges as major.minor.patch.
+
+* Version numbers are powerful tools for marketing, and especially for replacing old rubbish with new, exciting, rubbish.
+
+* If (if!) we remove support for retired contracts, the version number would make this clear. "Version X no longer supports the frongle interface."
+
+We can still provide version numbers by tracking the SBOM. I'd simply number the SBOM changes from 1 upwards, unless we find we need more detail. Perhaps the repository commit number within the SBOM number.
+
+++ Worked Example
+
+Since I like to eat my own cooking, I'm going to start using the SBOM approach for CZMQ, and if it works there, spread it to other projects. CZMQ implements a variety of ZeroMQ RFCs, and its own API contracts.
+
+From experience we know that a single CZMQ class can contain multiple contracts, each with its own state. E.g. zsys contains draft methods, stable methods, and retired methods. I'll to tag these API contracts as "draft", "stable", "legacy", or "retired". Further, when we change contracts (draft and stable, probably) we'll number those changes.
+
+So the SBOM for CZMQ might contain entries like this:
+
+[[code]]
+* czmq/zsys/udp.1/stable
+* czmq/zsys/presets.1/stable
+* czmq/zsys/interrupt.1/retired
+* czmq/zsys/interrupt.2/stable
+* zeromq/RFC/4/stable
+[[/code]]
+
+Where each entry in the SBOM matches a test case living either in CZMQ, or (ideally elsewhere). Incidentally, moving the tests out of the project solves the common question with contract driven development: "what if someone breaks a contract and then modifies the test case to hide that break?"
+
+++ Conclusions
+
+As I've explained, a living software product will usually deliver a mix of draft, stable, legacy, and retired contracts. Rather than try to assign a "major.minor.patch" version number to the overall mix, to indicate stability and maturity, it is more sensible to list the contracts explicitly in the living code (on git master).
+
+Implementations of draft contracts carry no promise of interoperability. It is fair to assume that the market for draft contracts is small, and the cost of change is low. Implementations of stable contracts are guaranteed to work with all other implementations of the same stable contract. A stable contract should be testable, and the claim of a vendor to implement it could be legally binding.
+
+By listing all contracts that a software project implements as a "Software Bill of Materials", or SBOM, we make it possible to test every single master commit against these contracts. While today we tend to run CI tests within a single project, it would be better to have external test suites, one per contract. Since people will demand version numbers of some sort, we can version the SBOM, and commits within that. So version 12.122 of a product will be SBOM version 12, commit #122.
+
+As a worked example, I will experiment with [http://czmq.zeromq.org CZMQ], one of the projects I'm mainly responsible for.

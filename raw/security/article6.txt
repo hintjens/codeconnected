@@ -1,0 +1,121 @@
+In this series of articles I'll explain how to use the new ZeroMQ security layers in your applications. The example we'll make is a chat application that provides unbreakable strong security. In this first article, I'll explain more about ZeroMQ's security technology, how it works, and why we chose it.
+
+++ The Case for Privacy
+
+The summer of 2013 was when privacy on the Internet died. Or rather, when our belief in privacy died, because the surveillance of our phone calls, emails, web searches, and chats has been going on for many years, if not since the start of the telegraph era.
+
+Privacy is a cost issue. An organization can secure its data centers from surveillance (by spies of all colors, whether they are foreign intelligence services, competitors, or criminals) by building its own physical networks and isolating these from the public Internet. However that is extraordinarily costly. More typically, we'll use  virtual private networks (VPNs) to create secure lines that cross public networks.
+
+VPNs are not reliably secure, however. They use long term keys that can be broken. They are complex to configure and to upgrade. The often use aging algorithms like RC4 [http://www.theregister.co.uk/2013/09/06/nsa_cryptobreaking_bullrun_analysis/ that are considered crackable].
+
+Even SSL/TLS [http://www.techdirt.com/articles/20130910/10470024468/flying-pig-nsa-is-running-man-middle-attacks-imitating-googles-servers.shtml#addyourcomment are not immune] from attack. The NSA themselves point out that the mainstream cryptography [http://www.nsa.gov/business/programs/elliptic_curve.shtml is over 20 years old], and state that "the best assured group of new public key techniques is built on the arithmetic of elliptic curves."
+
+Without the shield of cheap, trustable privacy, an organization cannot safely use the public Internet. What the NSA can break today, any competitor or foreign intelligence service can break tomorrow. In our connected world, this throws a pool of ice cold water over the growth of low-friction Internet commerce.
+
+++ Goals for ZeroMQ's Security Layers
+
+Just as ZeroMQ brought us cheap, standardized connectivity for distributed systems, our goals with the security layers (which I'll explain in a minute) are to bring cheap, standardized privacy and authentication for distributed systems. The focus here is on cost. Cryptography has not stood still since the 1970s and there are many excellent, strong security options. However they remain costly to learn, understand, and safely use.
+
+Here is our shortlist of goals:
+
+* //It must be very simple to use, and impossible to get wrong//. Complexity is the number one risk with cryptography and the number one vulnerability. Every additional option is a way to get it wrong and end up with an insecure system.
+
+* //It must be fast enough for real work//. If security makes a system too slow to use, people will switch it off, because the pragmatic need of being able to work today beats the risk of intrusion tomorrow.
+
+* //It must be based on standardized protocols//, so that it can be re-implemented by any team, verified independently, and improved outside of the software stack.
+
+* //It must have free and open source implementations//, so that the code can be inspected and fixed. One cannot trust a closed-source security stack, given the risk of secret backdoors.
+
+* //It must be free of patent risk//, so that it cannot be blocked on grounds of intellectual property violations.
+
+* //It must work with all ZeroMQ socket types//, and more generally, be interoperable with clear text messaging. A typical architecture will use clear text for internal messages, and security on external traffic.
+
+* //It must be built-in to the core libzmq library//, so that it is available to all language bindings. Full-native stacks like JeroMQ should be able to re-implement the security protocols.
+
+We started working on this in March of 2013, and the first formal publication will be in the forthcoming ZeroMQ/4.0.0 release. You can always get the latest version from the ZeroMQ GitHub project.
+
+++ How ZeroMQ Security Works
+
+The security architecture is broken into several layers:
+
+* A new wire protocol, [http://zmtp.org ZMTP 3.0], that adds a security handshake to all ZeroMQ connections.
+
+* A new security protocol, [http://curvezmq.org CurveZMQ], that implements "perfect forward security" between two ZeroMQ peers over a TCP connection. I'll explain CurveZMQ below.
+
+* A set of security mechanisms for ZMTP: NULL, PLAIN, and CURVE, each described by their own RFCs. NULL is essentially what we had before. PLAIN allows simple username and password authentication. CURVE implements the CurveZMQ protocol.
+
+* An extended API for libzmq that lets you choose and configure the security mechanism for any socket. The default is NULL. You can then upgrade the socket to PLAIN or CURVE, either as a client (that connects securely to one server), or a server (which authenticates any number of clients).
+
+* [http://rfc.zeromq.org/spec:27 A protocol (ZAP)] that lets you install arbitrary authentication servers. ZeroMQ lets you choose how you authenticate clients, be it via configuration files, LDAP, databases, etc.
+
+* Finally, a separate security library, [https://github.com/zeromq/libcurve Curve], that implements CurveZMQ on top of ZeroMQ. Curve is a reference implementation for the CurveZMQ protocol, and a way to get that functionality on older versions of ZeroMQ. It will work with ZeroMQ/2.x and ZeroMQ/3.x (but not interoperate with the ZeroMQ/4.x CURVE mechanism, that works at a different level).
+
+Let's walk through how we do secure PUB-SUB from one publisher to a number of subscribers, using the CURVE mechanism:
+
+* We generate a long term keypair for the publisher. ZeroMQ provides a tool (curve_keygen) to do this. We store the resulting keypair safely.
+
+* We manually distribute the public part of the keypair. This is a short text string. ZeroMQ does not do key exchange.
+
+* If we want to authenticate subscribers, we generate a keypair for each subscriber, store the public+secret keypair safely at each subscriber, and collect all public subscriber keys on the publisher.
+
+* Now, we can create a PUB socket and configure it with the long term keypair, and tell ZeroMQ that it is a server. This requires three zmq_setsockopt calls.
+
+* We can then create any number of SUB sockets, and configure each one with its own keypair, and the server's public key. Again, three calls to zmq_setsockopt.
+
+* We then bind the PUB socket, and connect the SUB sockets as usual.
+
+* The ZeroMQ messaging API is unchanged. We send and recv messages as before.
+
+One aspect that surprises some people is that one socket can have exactly one security level. You cannot have, for instance, PLAIN and CURVE subscribers connected to the same publisher. This would be technically feasible but would add extra work to applications to check the security level of every incoming message. It would make it easy to "get it wrong".
+
+++ The Curve Story
+
+Elliptic curve cryptography is a controversial topic. It has the reputation of being "backdoored" by the NSA, and heavily patented. There is no single curve, but an infinite number, and different curves have different strengths and weaknesses. Some of the "official" curves proposed by the NIST are suspect.
+
+We use [http://cr.yp.to/ecdh.html Curve25519] as designed by Daniel J. Berstein, which is the basis for the [http://nacl.cace-project.eu/features.html NaCl cryptographic library], more widely used as [https://github.com/jedisct1/libsodium libsodium].
+
+Curve25519 together with the other algorithms used in NaCl has some attractive features:
+
+* It is fast.
+* It [http://cr.yp.to/ecdh/patents.html has no known patent issues].
+* It is considered strong.
+
+Curve25519 provides encryption and authentication with 256-bit keys, equivalent to 3072-bit RSA keys.
+
+This isn't sufficient guard against the simplest threat, where an attacker records encrypted data today, and then decrypts that tomorrow, after getting the keys by force, subterfuge, or warrant.
+
+To prevent that, we need "perfect forward security", in which the two peers create temporary session keys and exchange those safely using the long-term keys. When the session is over, they discard their keys, and the encrypted data is then unreadable by anyone.
+
+D. J. Bernstein developed the [http://curvecp.org CurveCP] protocol for secure networking over UDP, part of which was a secure handshake that provides perfect forward security using Curve25519.
+
+The ZeroMQ CurveZMQ protocol is essentially a fork of CurveCP, adapted for use over TCP, and written as a single RFC.
+
+Clients and servers have long-term permanent keys, and for each connection, they create and securely exchange short-term transient keys. Each key is a public/secret keypair, following the elliptic curve security model.
+
+To start a secure connection the client needs the server permanent public key. It then generates a transient key pair and sends a HELLO command to the server that contains its short term public key. The HELLO command is worthless to an attacker; it doesn't identify the client.
+
+The server, when it gets a HELLO, generates its own short term key pair (one connection uses four keys in total), and encodes this new private key in a "cookie", which it sends back to the client as a WELCOME command. It also sends its short term public key, encrypted so only the client can read it. It then discards this short term key pair.
+
+At this stage, the server hasn't stored any state for the client. It has generated a keypair, sent that back to the client in a way only the client can read, and thrown it away.
+
+The client comes back with an INITIATE command that provides the server with its cookie back, and the client permanent public key, encrypted as a "vouch" so only the server can read it. As far as the client is concerned, the server is now authenticated, so it can also send back metadata in the command.
+
+The server reads the INITIATE and can now authenticate the client permanent public key. It also unpacks the cookie and gets its short term key pair for the connection. As far as the server is now concerned, the client is now authenticated, so the server can send its metadata safely. Both sides can then send messages and commands.
+
+This handshake provides a number of protections but mainly, //perfect forward security// (you cannot crack data encrypted using the short term keys even if you record it, and then later get access to the permanent keys) and //protection of client identity// (the client permanent public key is not sent in clear-text).
+
+++ Multilayer Security Using Libcurve
+
+ZeroMQ's built-in Curve security can protect only one hop. For a B-to-C use-case this is ideal, and acts as a replacement for TLS/SSL, without the certificate authorities, but with the added cost of pre-distribution of public keys.
+
+For C-to-B-to-C cases however, it is not sufficient, just as TLS/SSL is not sufficient. The cloud in the middle gets unencrypted traffic, and surveillance at that point is trivial.
+
+To solve this we need security at a higher layer (instead of, or in addition to, the transport-layer security).
+
+In effect this means encrypting messages //before// passing them to ZeroMQ, and then decrypting them after receiving them from ZeroMQ. The same requirement for perfect forward security applies, otherwise the data is vulnerable to key theft attacks.
+
+With our security architecture, we use the Curve library (libcurve) to handle this higher layer. Curve provides both low-level codecs (to encrypt and decrypt) messages, and high-level "virtual sockets" (that act like ZeroMQ sockets but do security behind the scenes).
+
+++ Coming Up
+
+Security is complex, but if done right, will protect your business secrets from attackers. In my next article I'll start show example code that does secure messaging, over ZeroMQ. If you want to contact me directly about using ZeroMQ's security in your architectures, email me at ph@imatix.com.

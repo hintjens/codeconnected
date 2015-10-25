@@ -1,0 +1,63 @@
+++ The Repeater Pattern
+
+So what is XPUB-XSUB upstreaming good for? At the risk of looking for problems to justify an elegant answer, let's examine one more pattern, which I call Repeater, mainly because calling it "Twitter" would violate trademarks. Repeater is any-to-all pub-sub for Very Large Networks. Any node can publish an event, and any other node, anywhere, can subscribe to such events.
+
+Creating a fully-interconnected network works well for smaller networks, say up to a hundred or two hundred nodes. This is the model we used in Zyre. Above that, the cost of managing state in each node becomes onerous. This limit increases steadily, as the computers in our pockets get more and more powerful. The real limit for a fully-interconnected network is probably around 1,000 or so today for clouds (the number of peers a server can happily track), and a hundred for mobile WiFi networks (limited by WiFi access points).
+
+The way to scale is to create mediators, i.e. middle-men or super-nodes. These can be permanent pieces of infrastructure, or they can be dynamic. Doing it dynamically is technically harder and can lead to strange results (like the "why is my PC suddenly so slow?" effect we used to see with Skype before Microsoft switched to permanent super-nodes) but it removes the upfront costs.
+
+What Repeater does is bounce messages off one or more mediators (permanent or dynamic, it's six and half-a-dozen). The scale of the network then depends on the capacity of each mediator, and the number of mediators.
+
+Let's explore the simplest Repeater design, which has one mediator. Usually we attach application code to dynamic clients, not to static servers, for a few reasons but mainly because application code tends to be fragile and toxic to the boxes it runs on. If we're going to invest in permanent mediators, we usually want them protected from the application developers.
+
+Dynamic mediators is another story; they are usually clients with an extra hat. If they crash, it's fine because another client can take over. But dynamic mediation is a bit beyond where we want to go today.
+
+In the minimal design, all client connect to a single mediator. We have already seen how XSUB can send messages upstream to XPUB. Obviously XPUB can re-broadcast any message it receives to all its subscribers. Every client is thus two hops away from every other client[figure].
+
+[[code type="textdiagram" title="Repeater Pattern"]]
+                     #-----------#
+                     | Mediator  |
+                     +-----------+
+                     |   XPUB    |
+                     '-----------'
+                        ^  ^  ^
+      .-----------------'  |  `-----------------.
+      |                    |                    |
+.-----+-----.        .-----+-----.        .-----+-----.
+|   XSUB    |        |   XSUB    |        |   XSUB    |
++-----------+        +-----------+        +-----------+
+|  Client   |        |  Client   |        |  Client   |
+#-----------#        #-----------#        #-----------#
+[[/code]]
+
+We'll take the old familiar weather update example. One client sends updates as rapidly as it can. The two other clients each subscribe to random zip codes and collect 100 updates. They then send their average back to the main task, which prints them out. The test then ends.
+
+Here's the code:
+
+[[code type="example" title="Repeater Pattern" name="repeater"]]
+[[/code]]
+
+Which runs as you'd expect:
+
+[[code]]
+$ ./repeater1
+zipcode=03943 avg=31F
+zipcode=08401 avg=19F
+[[/code]]
+
+The weather station can pump out about 2M messages per second on my laptop. That's a total of 12M messages flowing through the system each second, which isn't bad. It could be faster but the upstreaming code in libzmq isn't optimized.
+
+Repeater isn't the only plausible design for this use case. There are at least two others:
+
+* We could cross-connect all the clients and remove the single point of failure. I'd do this if we had a small number of clients that didn't change a lot. As the number of clients grows, discovery becomes more and more expensive and begins to cost more than the mediation.
+
+* We could use a different socket pattern for upstreamed messages, for instance PUSH-PULL. That would work fine. The mediator would not be any more complex: it would read on one socket, and send on another, a classic proxy (and it could even use zmq_proxy()). The clients would all need an extra socket if they wanted to receive as well as send messages.
+
+The main reason for using Repeater instead of a proxy is that the socket flows are a little simpler to understand, and every bit helps when you're making a design.
+
+What happens when we want to scale this to more mediators? On large networks it's common to see groups of clients clustered around local mediators. For instance weather stations in one region might all talk to a single mediator. We'd then federate the mediators together. Clients now sit one or more hops away from each other.
+
+As to federating the mediators themselves, we can either interconnect them, or use a further top-level mediator. It depends (as for clients) whether they're static or dynamic, and how many of them we have.
+
+In a federated network we will hit the problem of loops: a mediator may receive a message it already sent to another mediator. There are a few ways to avoid such loops. One, to organize the mediators in a strict tree where new messages flow to clients at one level, and up to the parent. Two, to push all new messages straight to a top-level mediator which flows them down the tree again. Three, to add addressing information to each message as it passes through mediators, so that a mediator can detect and discard messages it's already seen before. The first two tactics add latency because of the extra hops (a crucial difference between beer and networks), while the last requires smarter mediators.
+

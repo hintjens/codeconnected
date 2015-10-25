@@ -1,0 +1,83 @@
+Erik Hugne writes, "I've cooked up another example with real code illustrating load-balancing using the new TIPC transport for ZeroMQ. This demo uses overlapping port names." The code [https://gist.github.com/hintjens/7335589 is available to download].
+
+The REQ/REP load balancing example is using a small cluster with 4 nodes. A dummy service with ID=1000 is spawned on three nodes (1,2,3). Requests to this service ID are sent from Node 4.
+
+The dummy service is just listening for a message and prints it out once it arrives. It also sends a response message back to the client, telling it which host instance the message was handled by.
+
+First, load TIPC, assign node addresses and enable eth0 as the bearer interface. This is part of system configuration and is normally done by initscripts, but I'm including the steps for completeness.
+
+[[code]]
+Node1# modprobe tipc && tipc-config -a=1.1.1 -be=eth:eth0
+[[/code]]
+
+[[code]]
+Node2# modprobe tipc && tipc-config -a=1.1.2 -be=eth:eth0
+[[/code]]
+
+[[code]]
+Node3# modprobe tipc && tipc-config -a=1.1.3 -be=eth:eth0
+[[/code]]
+
+[[code]]
+Node4# modprobe tipc && tipc-config -a=1.1.4 -be=eth:eth0
+[[/code]]
+
+In this example, the nodes are KVM instances with the eth0 devices connected to a network bridge on the host machine.
+
+Starting the 0MQ service on Node 1-3:
+
+[[code]]
+Node1# ./srv -s tipc://{1000,0,10}
+server tipc://{1000,0,10} running
+[[/code]]
+
+[[code]]
+Node2# ./srv -s tipc://{1000,0,10}
+server tipc://{1000,0,10} running
+[[/code]]
+
+[[code]]
+Node3# ./srv -s tipc://{1000,0,10}
+server tipc://{1000,0,10} running
+[[/code]]
+
+Before sending any traffic, let's check how it looks like on our client Node4. Using tipc-config -nt, we can dump
+the whole, or parts of the name table.
+
+[[code]]
+Node4# tipc-config -nt=1000
+Type       Lower      Upper      Port Identity              Publication Scope
+1000       0          10         <1.1.3:2118189060>         2118189061  cluster
+                                 <1.1.2:3767599108>         3767599109  cluster
+                                 <1.1.1:1451425794>         1451425795  cluster
+[[/code]]
+
+Looks like we're good to go, Node4 knows that service 1000 is hosted by three nodes. Start sending some requests from Node4 to service 1000. Any instance number in the published range (0-10) can be used.
+
+[[code]]
+Node4# ./cli -c {1000,4}
+Node4 sending message to: tipc://{1000,4}
+client sent message 'hello world from Node4', rc=25
+Your request have been served by Node3
+
+Node4# ./cli -c tipc://{1000,4}
+Node4 sending message to: tipc://{1000,4}
+client sent message 'hello world from Node4', rc=25
+Your request have been served by Node2
+
+Node4# ./cli -c tipc://{1000,4}
+Node4 sending message to: tipc://{1000,4}
+client sent message 'hello world from Node4', rc=25
+Your request have been served by Node1
+
+Node4# ./cli -c {1000,4}
+Node4 sending message to: tipc://{1000,4}
+client sent message 'hello world from Node4', rc=25
+Your request have been served by Node3
+[[/code]]
+
+Here we can see that each subsequent request are directed in a round robin manner between the instances running on Node1-3.
+
+Client applications can define their own policies/algorithms how to spread the instance numbers of the connections. By increasing/reducing the width of the server publications (the lower/upper numbers) for some of the blades, we can increase/reduce the number of connections handled by these blades.
+
+There are some rules that limits the TIPC name overlapping, these can be found in the TIPC programmers guide.

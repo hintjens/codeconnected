@@ -1,0 +1,6 @@
+for a in grasslands strawhouse woodhouse stonehouse ironhouse ironhouse2; do
+    c -q -l $a 
+    ./$a
+done
+
+

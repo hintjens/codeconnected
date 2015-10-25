@@ -1,0 +1,292 @@
+Thanks to the quiet but persistent work of Martin Hurton, [https://github.com/zeromq/libzmq the master branch of libzmq], the ZeroMQ core library, now "does security". In this last article in the mini-series, "Securing ZeroMQ", I'll explain what we built, and why, and how this can work for your ZeroMQ applications.
+
+++ Preamble
+
+Let me start by stating for the record that I'm not a security expert. I've got many... //talents//, such as knowing immediately if someone has sipped from my glass of beer, or making too many friends in too many places. But a deep and confident knowledge of how to stop the NSA reading my most private communications isn't one of them. However, the goal of this exercise is indeed to give us secure communications using ZeroMQ.
+
+What is "security"? It's not one thing but a lot of answers to a lot of problems. At the core if A says something confidential to B, then A wants to know that C can't read it, can't modify it, can't pretend to be B, and can't imitate A either. But it goes further than this. Sometimes C will simply steal B's laptop, or kidnap B and torture him to give up his secret passwords. 
+
+If you study this long enough, you realize no-one is really a security expert. There are cryptographers and mathematicians, protocol designers and malware specialists, operating system security experts, code breakers and forensic cryptographers and on and on. I don't think any single person or team can build "security" or can even really know all the angles. What use is the best security library in the world if the application allows trivial SQL injections? Or if the operating system has known vulnerabilities? Or if the system admin is corrupt?
+
+So this brings us back to something I repeat often in my writing and talks: it takes a big, diverse community to solve the hardest problems decently and cheaply. Luckily ZeroMQ is just that, which means given the "what" and the "who", I can segue into the "how".
+
+++ How to solve a Very Difficult Problem
+
+To solve a VDP, one starts by building a Minimal Plausible Solution, or MPS, and throwing this into the circus where the crowd can gather to watch it being torn apart by wild animals and religious fanatics. The crowd then realizes they can do better, so they make improvements and changes to the MPS and in turn throw these better versions into the ring. Over time the sport develops into a wild and furious game where the crowd split into factions each cheering different variations, and the noise attracts yet more wild animals and fanatics.
+
+It's not quite that simple, but more or less, if you can throw a MPS into the ring and if people can improve this freely, you have a decent chance of seeing really good solutions emerge over time.
+
+What are the characteristics of a good MPS? First, it must not take itself too seriously. You're designing Steak Tartar, remember. It has to be provocative and cheerfully cheap and simple. You're aiming for //plausibility//, not //certainty//.
+
+Second, it has to at least work, so it can walk under its own power into the center of the ring, ready to be torn apart. We want the spectacle, the bloodshed, the drama, for it's this that pushes others to get involved. No crowd ever rioted after being shown a 50-slide PowerPoint.
+
+Third, it has to be remixable in all directions. In the old days, when we ran punched card FORTRAN-77 on UNIVAC mainframes, we built security systems via committees of gray bearded elders who signed contracts defining who was allowed to make improvements to their Codes. These days we push everything under the (L)GPL and the use GitHub fork+pull request model. Old men are still welcome but only if they cut off their beards.
+
+One of my talents is, I think, designing great MPSs and understanding how the circus works.
+
+So this is what we've done for security for ZeroMQ. As you ask, "why didn't you implement SSL or TLS?", that makes you one of the wild animals. Enjoy the //Steak haché tartare//, it was meant for you.
+
+++ Collecting the Problems
+
+Diving down into the real grist of a minimal plausible solution, we need to collect some valid problems. It's no use producing an MPS for the wrong problems, that does nothing except waste everyone's time.
+
+So what are the problems we need to solve first? You'd think it was something like "how do we implement a TLS handshake?" or some-such. But it turns out to be more meta than that. I started my research by looking at various security models, and making some quite elegant prototypes, but all I really learned was that choosing any particular model would be a mistake.
+
+This is the first problem to solve: our own guaranteed incompetency when it comes to security. Even if we could build a perfect security model today (which I really doubt), it would become broken over time. It is not smart to build an expiration date into your software, especially if you are trying to make general purpose, long-lasting infrastructure, which is our goal with ZeroMQ.
+
+There is, luckily, a known way to avoid having to choose a single security model, exemplified by [http://en.wikipedia.org/wiki/Simple_Authentication_and_Security_Layer SASL], an Internet security standard that's been used in quite a few protocols now. What SASL does, which is neat, is to delegate all security to a "mechanism" that client and server can implement independently of the rest of the protocol.
+
+I find SASL overly complex, so would not implement it as-such unless someone was paying me to be inefficient. However it's quite doable to get the same effect with a simpler design. We stick a "mechanism name" into our protocol, and then depending on the mechanism the client and server propose, we call some plug-in library to handle the actual handshake.
+
+The second problem is how to codify this so that we can get multiple independent implementations. It would be a big mistake to start by writing code (except as throw-away experiments). We need some formality that different stacks can aim at. Thus, standardization, and more specifically, in the [http://rfc.zeromq.org/spec:23/ZMTP ZeroMQ Message Transport Protocol] (ZMTP) we use to tie our networks together. 
+
+Next, we need to prove our design by making a few different security mechanisms. It would be poor taste to force everyone into using full encryption, whether they need it or not. Some protocols then offer an on/off choice (e.g. insecure or secure HTTP). But it's smarter, I believe, to offer N choices, which can cover a spectrum of options. It fits with notion of extensible security and it also seems to fit what people really want, which is a sliding scale of trade-offs (usually performance and simplicity versus security).
+
+So, let's recap our first set of problems:
+
+* Making an extensible security model.
+* Writing this up as a proper protocol specification.
+* Creating a first set of security mechanisms.
+
+We've been evolving ZMTP for some years from a [http://rfc.zeromq.org/spec:1/SPB minimal adolescent framing protocol] to a more [http://rfc.zeromq.org/spec:15/ZMTP adult industrial-strength protocol]. For example, adding a version header made it possible for newer versions of libzmq to talk safely to older ones, something that was impossible before.
+
+ZMTP 3.0 basically breaks down into four layers or phases:
+
+[[code]]
++-------------------------------+
+|       Version detection       |
++-------------------------------+
+|      Security handshake       |
++-------------------------------+
+|      Metadata exchange        |
++-------------------------------+
+|    Messages and commands      |
++-------------------------------+
+[[/code]]
+
+The two peers exchange signatures and agree on a version; they then exchange credentials and agree on their security; they then exchange meta-data; and they then exchange commands and messages. The security handshake happens as early as possible to avoid leaking any information (the metadata) about peers.
+
+I'm not going to explain ZMTP in much detail since there is [http://rfc.zeromq.org/spec:23/ZMTP a detailed RFC]. But I can explain some of the design decisions. The mechanism is a single string. The two peers have to agree on this, or they can't work together. This is one big deviation from SASL, which allows peers to negotiate security dynamically. That could work in ZeroMQ but would force us to make the message API more complex (to indicate the level of security of the sender). We can't prove we need SASL's extra flexibility. So we allow just a single security mechanism.
+
+ZMTP then specifies three default security mechanisms, NULL, [http://rfc.zeromq.org/spec:24/ZMTP-PLAIN PLAIN], and [http://rfc.zeromq.org/spec:25/ZMTP-CURVE CURVE]. The last two are specified by their own RFCs. They all use a somewhat similar handshake. The libzmq library implements the three mechanisms as separate classes.
+
+So extensibility is now simple: create a new RFC that documents a new mechanism, and add the necessary class to libzmq. It's probably a week or two of work to add a new security mechanism like DTLS.
+
+I'll briefly explain the three mechanisms. NULL means the client doesn't provide any credentials. We can check things like the IP address. PLAIN means the client provides a name and password, without encryption. It's meant to stop us doing stupid things like sending test data to production servers. Finally, CURVE implements an elliptic curve handshake called CurveZMQ, which is based on CurveCP. I'll explain this next.
+
+++ Elliptic Curve Security, CurveCP, and CurveZMQ
+
+CurveZMQ is a MPS for "full security" that was a lot more fun to make, and plausibly much more valuable, than an older asymmetric encryption model. I'm not a security expert, but elliptic curve cryptography, or ECC, [http://www.linuxjournal.com/content/elliptic-curve-cryptography works with shorter keys] and uses less CPU than conventional cryptography.
+
+However that's almost incidental. The real reason I chose to make CurveZMQ is because of something called [http://curvecp.org CurveCP], a protocol and stack designed by mathematician and cryptographer Daniel J. Bernstein, author of the NaCl library. CurveCP was announced at the 27th Chaos Communication Congress on 28 December 2010 and CurveCP implementations are still considered experimental. I'm not going to claim CurveCP has any magical properties, is superior, or even works as-such. Indeed, the CurveCP protocol and software really could not work with ZeroMQ in any easy way, since it's designed to work over UDP.
+
+Nonetheless, CurveCP starts with a handshake between client and server, and this handshake turns out, after we chop and cook it in various ways, to work very well both over TCP and over ZeroMQ DEALER-ROUTER, and to fit into our SASL-lite security model. There's [http://rfc.zeromq.org/spec:26/CURVEZMQ a detailed RFC for CurveZMQ] which explains the precise chopping and cooking I had to do. 
+
+CurveZMQ is essentially the CurveCP handshake, trimmed and cleaned-up to work over any bidirectional message transport, and documented as an RFC. I'm not yet sure how good or bad this is, but recall that we can't afford to take any particular mechanism too seriously. This is a minimal plausible solution for encryption, no more or less.
+
+What immediately caught my attention was DJB's stated goal of making his APIs simple. The NaCl API is beautifully simple. I've worked with OpenSSL and it uses the industry standard approach of "expose every possible choice upfront with zero hints as to what is really vital, and what you will never ever use".
+
+Whereas NaCl hides everything it can, on the theory that offering choices to people like me about what what key sizes or hashing algorithms to use is just asking for trouble. And I totally agree. NaCl is really like ZeroMQ, it hides choices we usually only get wrong.
+
+Love at first sight! Whether or not the thing actually works, it was fun to learn and use and that's a powerful indicator. NaCl is in fact wrapped up as [https://github.com/jedisct1/libsodium libsodium], which is the library we use.
+
+So I wrote up CurveZMQ as a proper RFC and made [https://github.com/zeromq/libcurve a reference implementation]. This library serves a double purpose. It acts as a guide to people implementing CurveZMQ and it can also be used by applications to do CurveZMQ encoding above ZeroMQ, to get end-to-end encryption. This is a little complex, and I'll make a real example app sometime to demonstrate it.
+
++++ Helicopter View of CurveZMQ
+
+To start a secure connection the client needs the server long term key. It then generates a short term key pair and sends a HELLO command to the server that contains its short term public key. The HELLO command is worthless to an attacker; it doesn't identify the client.
+
+The server, when it gets a HELLO, generates its own short term key pair (one connection uses four keys in total), and encodes this new private key in a "cookie", which it sends back to the client as a WELCOME command. It also sends its short term public key, encrypted so only the client can read it. It then discards this short term key pair.
+
+At this stage, the server hasn't stored any state for the client. It's generated a keypair, sent that back to the client in a way only the client can read, and thrown it away.
+
+The client comes back with an INITIATE command that provides the server with its cookie back, and the client long term public key, encrypted so only the server can read it. As far as the client is concerned, the server is now authenticated, so it can also send back metadata in the command.
+
+The server reads the INITIATE and can now authenticate the client long term key. It also unpacks the cookie and gets its short term key pair for the connection. As far as the server is now concerned, the client is now authenticated, so the server can send its metadata safely. Both sides can then send messages and commands.
+
+This handshake provides a number of protections but mainly, //perfect forward security// (you cannot crack data encrypted using the short term keys even if you record it, and then later get access to the long term keys) and //protection of client identity// (the client long term key is not sent in clear-text). 
+
++++ Security Goals for CurveZMQ
+
+Despite treating CurveZMQ as a disposable MPS, I want it to be solid against at least these attacks (this list is based on the CurveCP documentation):
+
+* //Eavesdropping,// in which an attacker sitting between the client and server monitors the data. We send all in boxes that only the authentic recipient, knowing the necessary secret key, can open.
+
+* //Fraudulent data,// in which an attacker creates packets that claim to come from the server or client. Only the authentic sender, knowing the necessary secret key, can create a valid box, and thus a valid packet.
+
+* //Altering data,// in which an attacker sitting between client and server manipulates packets in specific ways. If a packet is modified in any way, the box it contains will not open, so the recipient knows there has been an attack and discards the packet.
+
+* //Replaying data,// in which an attacker captures packets and re-sends them later to imitate a valid peer. We encrypt every box with a unique nonce. An attacker cannot replay any packet except a Hello packet, which has no impact on the server or client. Any other replayed packet will be discarded by its recipient.
+
+* //Amplification attacks,// in which an attacker makes many small unauthenticated requests but uses a fake origin address so large responses are sent to that innocent party, overwhelming it. Only a Hello packets are unauthenticated, and they are padded to be larger than Cookie packets.
+
+* //Man-in-the-middle attacks,// in which an attacker sitting between client and server substitutes its own keys so it can play "server" to the client and play "client" to the server, and thus be able to open all boxes. Since long-term keys are known beforehand, an attacker cannot successfully imitate a server, nor a client if the server does client authentication.
+
+* //Key theft attacks,// in which an attacker records encrypted data, then seizes the secret keys at some later stage, perhaps by physically attacking the client or server computer. Client and server use connection keys that they throw away when they close the connection.
+
+* //Identifying the client,// in which an attacker traces the identity of a client by extracting its public long-term key from packets. The client sends this only in an Initiate packet, protected by the connection keys.
+
+* //Denial-of-Service attacks,// in which an attacker forces the server to perform expensive operations before authentication, thus exhausting the server. CurveCP uses high-speed high-security elliptic-curve cryptography so that a typical CPU can perform public-key operations faster than a typical Internet connection can ask for those operations. The server does not allocate memory until a client sends the Initiate packet.
+
+++ Client Authentication 
+
+When we get a new connection into a server, we may have to check whether the client is allowed to connect or not. It's one of those problems that gets complex and messy quite quickly. Do we support password files, key files, databases, LDAP, PAM, GSSAPI, etc.?
+
+As usual my favorite way to solve complex problems is to cheat and make this "someone else's problem". For authentication, what I wanted was a way to //not implement// any of the above list in the libzmq library, and still make it simple to support any of the above. 
+
+The answer in this case is to use ZeroMQ itself. The library, getting a new connection, sends a message requesting a yes/no decision, and someone gets the message, does the work, and sends a reply:
+
+[[code]]
++----------+
+|          |
+|  Client  |
+|          |
++----------+
+     |
+     |          TCP connection
+     V
++----------+
+|          |
+|  Server  |
+|          |
++----------+
+|   REQ    |
++----------+    inproc://
+|   REP    |
++----------+
+|          |
+|  Handler |
+|          |
++----------+
+[[/code]]
+
+We can use the REQ-REP pattern over @@inproc://@@. If the process is built without any handler, the server won't authenticate clients (will allow them all). A handler can also proxy requests to out-of-process handlers, over local networking or @@ipc://@@.
+
+I wrote this up as an RFC, called [http://rfc.zeromq.org/spec:27/ZAP the ZeroMQ Authentication Protocol], or ZAP. Here's an example of a ZAP authentication request sent by a server to a handler, for a client using the PLAIN mechanism:
+
+[[code]]
++-+
+| |                 Empty delimiter frame
++-+---+
+| 1.0 |             Version number   
++-----++
+| 0001 |            Request ID, for example "0001"
++------+
+| test |            Domain, empty in this case
++------+-------+
+| 192.168.55.1 |    Address
++-------+------+
+| PLAIN |           Mechanism
++-------+
+| admin |           Username
++-------++
+| secret |          Password
++--------+
+[[/code]]
+
+This shows an example reply from the handler to the server:
+
+[[code]]
++-+
+| |                 Empty delimiter frame
++-+---+
+| 1.0 |             Version number   
++-----++
+| 0001 |            Request ID echoed from request
++-----++
+| 200 |             Status code
++----++
+| OK |              Status text
++----++
+| joe |             User id
++-+---+
+| |                 Metadata, empty
++-+
+[[/code]]
+
+It's a neat design because it works entirely out-of-band. That is, authentication doesn't affect message flow, can take as long as it has to, and can be handled by components that are fully independent of the application.
+
+++ The ZeroMQ Security API
+
+The security API is a set of new options that you apply to client or server sockets. 
+
+Here's how we configure a server socket for PLAIN security:
+
+[[code]]
+as_server = 1;
+zmq_setsockopt (server, ZMQ_PLAIN_SERVER, &as_server, sizeof (int));
+[[/code]]
+
+And here's how we configure a client socket, which needs to know a username and password to send to the server:
+
+[[code]]
+strcpy (username, "admin");
+strcpy (password, "password");
+zmq_setsockopt (client, ZMQ_PLAIN_USERNAME, username, strlen (username));
+zmq_setsockopt (client, ZMQ_PLAIN_PASSWORD, password, strlen (password));
+[[/code]]
+
+Here's how we configure a server socket for CURVE security:
+
+[[code]]
+//  Test keys from the zmq_curve man page
+char server_secret [] = "JTKVSB%%)wK0E.X)V>+}o?pNmC{O&4W4b!Ni{Lh6";
+as_server = 1;
+zmq_setsockopt (server, ZMQ_CURVE_SERVER, &as_server, sizeof (int));
+zmq_setsockopt (server, ZMQ_CURVE_SECRETKEY, server_secret, 40);
+[[/code]]
+
+And here's how we configure a client socket, which needs to know three keys:
+
+[[code]]
+//  Test keys from the zmq_curve man page
+char server_public [] = "rq:rM>}U?@Lns47E1%kR.o@n%FcmmsL/@{H8]yf7";
+char client_public [] = "Yne@$w-vo<fVvi]a<NY6T1ed:M$fCG*[IaLV{hID";
+char client_secret [] = "D:)Q[IlAW!ahhC2ac:9*A}h:p?([4%wOTJ%JR%cs";
+
+zmq_setsockopt (client, ZMQ_CURVE_SERVERKEY, server_public, 40);
+zmq_setsockopt (client, ZMQ_CURVE_PUBLICKEY, client_public, 40);
+zmq_setsockopt (client, ZMQ_CURVE_SECRETKEY, client_secret, 40);
+[[/code]]
+
+The application has to handle key exchange. For now the simplest model is that clients are given the server public key, and servers do not authenticate clients.
+
+++ The Z85 Encoding Standard
+
+The nice thing about standards is that you have so much choice. Wikipedia lists more than a dozen Base64 variations of dubious interoperability. 
+
+Why am I talking about Base64? Because exchanging binary keys is a royal pain. Almost as soon as we tried using CURVE security we hit the problem of how to represent keys in source code. For sure, you can encode binary as escape sequences but that's not portable between languages and doesn't work in configuration files, on the command line, or in emails.
+
+Base64 is the common "standard" but it has several things about it that are nasty. First, there is no single standard so there's no real guarantee that Base64 implementations will work together. Second, it is a clumsy fit for binary data, and this is one reason there are so many variations. Base64 encodes 3 bytes of binary data as 4 characters. Yet most chunks of binary data are multiples of 4 or 8 bytes. That "divide by 3" aspect makes Base64 implementations more complex and fragile than such a simple problem deserves.
+
+So I took an existing little-used encoding (Ascii85) and fixed it to make it safe to use in strings (so, also in XML, in JSON, on the command line, etc.) The result is [http://rfc.zeromq.org/spec:32/Z85 Z85], which is "more compact than Base16, more reliable than Base64, and more usable than Ascii85".
+
+I like Z85, because [https://raw.github.com/zeromq/libzmq/master/tools/z85_codec.h the code turned out to be simple and clean]. That's always a good sign. The codec I wrote uses a precomputed table to rapidly convert from Base85 (Z85) to Base256 (binary).
+
+Some people of course didn't like the introduction of Yet Another RFC, and they're right in some respects. I don't think it matters too much: I enjoyed making this little package; if it becomes a problem to others, someone will make a Base 64 encoding for the libzmq API.
+
+The trick is when you do a setsockopt, if the key length is 32, it assumes binary. If the length is 40, it assumes Z85. If the key length is 44 (I think... or 43 perhaps?) you could assume Base 64.
+
+++ Current Status
+
+We got the security test cases running on June 21/22 at our ZeroMQ Developers' Meeting in Brussels, thanks to Ian Barber and Martin Hurton (who did the bulk of the work in libzmq). It's all on libzmq master today, and supported in the CZMQ binding. Other bindings will start to implement the security API options soon.
+
+This all works, which is somewhat shocking.
+
+It's also remarkably simple, which is also a pleasant surprise. We have, for applications:
+
+* Three new options for PLAIN security.
+* Five new options for CURVE security.
+* One inproc:// plug-in endpoint for authentication handlers.
+* One tool that generates new keypairs (in tools/curve_keygen).
+
+And for those who want to get their hands dirty:
+
+* Extensible classes in libzmq so anyone can try their hand at new mechanisms.
+* A whole bunch of new [http://rfc.zeromq.org RFCs] along with [https://github.com/zeromq/rfc reference implementations].
+
+++ Conclusions
+
+Of course no story is over until the main characters have been slaughtered in an orgy of bloodletting that leaves the audience shocked and traumatized and asking "why?" I'm sure CurveZMQ and ZAP and Z85 will get their Red Wedding in time. When it happens, I'd enjoy wielding the knife but it really doesn't matter as long as we make space for further interesting characters over time.
+
+I'll be using the new security mechanisms in FileMQ, Zyre, and some other applications. There are a few other things still to fix in libzmq before this is ready for Internet use, and perhaps we'll print this as a new major version. I think it deserves it. But that's another story, for another day.

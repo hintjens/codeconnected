@@ -1,0 +1,337 @@
+In the previous article I gave an overview of how and why ZeroMQ's security layers work. In this article I'll develop a simple secure application, step by step. We'll use a simple example of a server PUSH socket sending "Hello" to a client PULL socket. We'll work through the ZeroMQ NULL, PLAIN, and CURVE security mechanisms, up to full authentication. The examples are in C but the principles apply to all languages.
+
+[[toc]]
+
+++ Requirements & Kicking Off
+
+For this tutorial you will ZeroMQ v4.0, CZMQ v2.0, and Sodium (the crypto library). We will build from source, since we're going to be coding anyhow. You can grab these either as download packages (here's [https://download.libsodium.org/libsodium/releases/ Sodium], [http://zeromq.org/intro:get-the-software ZeroMQ], and [http://czmq.zeromq.org/page:get-the-software CZMQ]), or from GitHub (here's [https://github.com/jedisct1/libsodium Sodium], [https://github.com/zeromq/libzmq ZeroMQ], and [https://github.com/zeromq/czmq CZMQ]).
+
+Sodium is a packaging of the [http://nacl.cr.yp.to/ NaCl crypto library], which implements the Curve25519 elliptic curve cryptography (ECC) algorithm. It doesn't matter for this tutorial, but when you use ECC in real work, people will ask you (a) isn't ECC backdoored by the NSA?, and (b) how secure is this, and (c) how fast is it, and (d) who else uses it?
+
+The answers are, at least today, (a) some ECC curves may be, and older crypto like RSA probably is, but Curve25519 is not, (b) it provides 256 bit ECC keys which is as strong as 3072 RSA keys, and (c) it's one of the fastest elliptic curves out there. Also, (d) it's not exactly mainstream, but is gaining popularity and Google is using it for their Quik protocol.
+
+I'll assume you're working on Linux or OS/X and have gcc or similar installed, and some idea of how to compile and link C programs. The API I'll use is that provided by CZMQ. If you are working in another language, it may or may not provide the same level of abstraction. I'll explain what CZMQ is doing, in any case.
+
+Here's how to build from GitHub (building from packages is very similar, you don't clone a repo but unpack a tarball):
+
+[[code]]
+git clone git://github.com/jedisct1/libsodium.git
+cd libsodium
+./autogen.sh
+./configure && make check
+sudo make install
+sudo ldconfig
+cd ..
+
+git clone git://github.com/zeromq/libzmq.git
+cd libzmq
+./autogen.sh
+./configure && make check
+sudo make install
+sudo ldconfig
+cd ..
+
+git clone git://github.com/zeromq/czmq.git
+cd czmq
+./autogen.sh
+./configure && make check
+sudo make install
+sudo ldconfig
+cd ..
+[[/code]]
+
+Next, let's check that things are working, with a minimal example:
+
+[[code type="example" title="Hello, Curve" name="hello"]]
+[[/code]]
+
+Here's how I build and run this:
+
+[[code]]
+gcc -o hello hello.c -lczmq -lzmq -lsodium
+./hello
+[[/code]]
+
+If that prints "Hello, Curve", then you're on the road to success. If not, check you have the necessary packages. On Debian/Ubuntu, you'll need {{build-essential}}, for instance.
+
+++ What We'll Make
+
+We'll make a minimal server-to-client PUSH-PULL flow with one server and one client. To make things really simple, the server will bind, the client will connect, and the server will send one message to the client:
+
+[[code type="textdiagram" title="Minimal Server to Client"]]
+#------------#
+|   SERVER   |
++------------+
+|    PUSH    |
+'------------'
+      |
+      |
+      v
+.------------.
+|   CLIENT   |
++------------+
+|    PULL    |
+#------------#    
+[[/code]]
+
+I'm going to make this in five steps, so you can see the different security patterns that are possible with today's ZeroMQ. To make it easy to remember these five patterns, I've given them mnemonic names:
+
+* **Grasslands**, which is plain text with no security at all. All connections are accepted, there is no authentication, and no privacy. This is how ZeroMQ always worked until we build security into the wire protocol in early 2013. Internally, it uses a security mechanism called "NULL", but you don't even see that.
+
+* **Strawhouse**, which is plain text with filtering on IP addresses. We still use the NULL mechanism, but we install an authentication hook (I'll explain this in a second) that checks the IP address against a whitelist or blacklist and allows or denies it accordingly.
+
+* **Woodhouse**, which extends Strawhouse with a name and password check. For this, we use a mechanism called "PLAIN" (which does plain-text username and password authentication). It's still really not secure, and anyone sniffing the network (trivial with WiFi) can capture passwords and then login as if they were the real Joe.
+
+* **Stonehouse**, which switches to the "CURVE" security mechanism, giving us strong encryption on data, and (as far as we know) unbreakable authentication. Stonehouse is the minimum you would use over public networks, and assures clients that they are speaking to an authentic server, while allowing any client to connect.
+
+* **Ironhouse**, which extends Stonehouse with client public key authentication. This is the strongest security model we have today, protecting against every attack we know about, except end-point attacks (where an attacker plants spyware on a machine to capture data before it's encrypted, or after it's decrypted).
+
+As I said in my last article, privacy is about cost, and these patterns get increasingly expensive to use. Stonehouse and Ironhouse are not as easy to deploy as TLS, for instance. But they are also much more expensive to break, and for most ZeroMQ users that is a good tradeoff.
+
+++ The Grasslands Pattern
+
+We'll kick off with the simplest possible example, which looks just like classic ZeroMQ code, because it is:
+
+[[code type="example" title="Grasslands Pattern" name="grasslands"]]
+[[/code]]
+
+To keep the code short and focus on the API calls, I'm not handling errors here. This is fun, but dangerous, like driving a motorbike without a seatbelt. In practice, since your code //will// fail in lots of unexpected places, it's wise to catch at least the more basic problems early on.
+
+When you start to use the ZeroMQ and CZMQ security APIs, the main symptom of confusion will be "nothing happens", in other words, there's no connection when you expect one. To make sure it's not a basic bind/connect error, at least check the return codes from those two calls. For example:
+
+[[code]]
+int rc = zsocket_bind (server, "tcp://*:9000");
+//  If the bind fails, don't even attempt to recover
+assert (rc != -1);
+[[/code]]
+
+There are people who hate asserts, but they're an extremely useful and brutal tool for forcing your code through a single sane path, and giving you accurate and early proof of errors.
+
+++ The Strawhouse Pattern
+
+Our next model takes the same code and adds address checking. I'll explain what we're doing and how it works in detail, first here is the application code:
+
+[[code type="example" title="Strawhouse Pattern" name="strawhouse"]]
+[[/code]]
+
+When you use CZMQ, all authentication happens through a {{zauth}} object, aka an "authenticator". In the Strawhouse code we create an authenticator, we enable verbose tracing (during development, at least), and we whitelist one address. Then we do the same work as Grasslands, and finally we destroy the authenticator:
+
+[[code]]
+zauth_t *auth = zauth_new (ctx);
+zauth_set_verbose (auth, true);
+zauth_allow (auth, "127.0.0.1");
+...
+zauth_destroy (&auth);
+[[/code]]
+
+Internally, the authenticator talks to libzmq across [http://rfc.zeromq.org/spec:27 a protocol called ZAP], aka RFC 27. Every single time a client tries to connect to a server, libzmq asks the ZAP handler (the authenticator), if there is one installed, to allow or deny the connection.
+
+We tell libzmq that the server socket is in fact a "server" in the sense that it authenticates clients, by using this call:
+
+[[code]]
+zsocket_set_zap_domain (server, "global");
+[[/code]]
+
+The ZAP //domain// concept lets you define authentication groups. For instance a set of server sockets could say, "We're in a domain called "test" and we only accept localhost IP addresses". CZMQ doesn't implement domains yet, and the "global" domain we use here has no significance at all. Remember that in this example we're using the NULL security mechanism, and by default libzmq just accepts NULL connections, period. But the simple fact of telling libzmq, "Please set domain X on this socket (with the default NULL security mechanism)" will cause it to act as a server, and call the ZAP handler for every client request.
+
+You can mix different kinds of security in one application, by using different sockets, and then configuring each security mechanism separately in the authenticator. So it will handle PLAIN in one way, CURVE another way, and so on.
+
+Now, to CZMQ's IP address filtering. This uses whitelisting and blacklisting, and works thus:
+
+* You can whitelist one or more addresses, or blacklist one or more addresses. We do this through the zauth_allow() and zauth_deny() calls, rather than loading external files.
+
+* The whitelist or blacklist applies to all requests that the authenticator gets from libzmq. That is, any NULL socket with a ZAP domain set, any PLAIN server socket, or any CURVE server socket, on that ZeroMQ context.
+
+* If you have a whitelist (one or more addresses), that means, "reject any address that's not in the whitelist". Think of a private party, a very large bouncer, and a sheet of paper with names on it. //"Sorry, buddy, you're not on the list. Please move out of the way."//
+
+* If you have a blacklist (one or more addresses), that means, "reject any address that's in the blacklist". Think of a public function with a couple of very large bouncers and a sheet of paper with names on it. //"Hey buddy, didn't we tell you to never show your face here again?//" You won't use both a whitelist and a blacklist, unless you want to make the bouncers confused, and angry.
+
+* If not denied, and the security mechanism is NULL, then the connection is allowed.
+
+* If not denied, and the mechanism is PLAIN or CURVE, then the authenticator carries on with its checking. So perhaps you're on the whitelist, or not on the blacklist, but now we need to see some identification, please.
+
+So in our example, where we allow "127.0.0.1", we effectively deny every other client address.
+
+++ The Woodhouse Pattern
+
+Next, let's see how to do username and password authentication. Here is the full example:
+
+[[code type="example" title="Woodhouse Pattern" name="woodhouse"]]
+[[/code]]
+
+Setting up the authenticator and the whitelist is the same as in Strawhouse, and I won't explain that again. The new API calls happen in three places in the code:
+
+[[code]]
+//  Tell the authenticator how to handle PLAIN requests
+zauth_configure_plain (auth, "*", "passwords");
+...
+//  Before binding the server
+zsocket_set_plain_server (server, 1);
+...
+//  Before connecting the client
+zsocket_set_plain_username (client, "admin");
+zsocket_set_plain_password (client, "secret");
+[[/code]]
+
+Bear this in mind: you have to configure a socket before doing a _bind or _connect on it. If you run the Woodhouse example without a password file, it'll never complete. Since we enabled tracing, you'll see it print out this:
+
+[[code]]
+I: PASSED (whitelist) address=127.0.0.1
+I: DENIED (PLAIN) username=admin password=secret
+[[/code]]
+
+The message in fact repeats because ZeroMQ re-tries the connection over and over. We mught change this behavior but it's not significant here. Let's create a password file, "passwords", in the current directory, with some entries, one per line:
+
+[[code]]
+guest=guest
+tourist=1234
+admin=secret
+[[/code]] 
+
+Then run the Woodhouse example again, and it'll print this:
+
+[[code]]
+I: PASSED (whitelist) address=127.0.0.1
+I: ALLOWED (PLAIN) username=admin password=secret
+Woodhouse test OK
+[[/code]]
+
+++ The Stonehouse Pattern
+
+Plain text is what it is. Anyone with half a malicious intent can sniff traffic and impersonate real clients, and make a mockery of your so-called security. That may be fine, or it may be a problem. The next level up is Stonehouse, which changes the game somewhat. Here's the example code:
+
+[[code type="example" title="Stonehouse Pattern" name="stonehouse"]]
+[[/code]]
+
+Stonehouse starts with a single call to the authenticator that switches on the CURVE_ALLOW_ANY feature:
+
+[[code]]
+zauth_configure_curve (auth, "*", CURVE_ALLOW_ANY);
+[[/code]]
+
+Here we do that for the domain "*", meaning all domains. Recall that CZMQ doesn't deal with domains yet, so if you use Stonehouse on one server socket, it will apply to all server sockets in the same context.
+
+Now, let's talk about certificates. For any CURVE security you need a "long-term public / secret keypair" for the client, and for the server. CZMQ wraps up a keypair along with metadata (a name, email address, etc.) as a "certificate", which can be an in-memory object, or a disk file. Here is the explanation from the zcert class:
+
+> The zcert class provides a way to create and work with security certificates for the ZMQ CURVE mechanism. A certificate contains a public + secret key pair, plus metadata. It can be used as a temporary object in memory, or persisted to disk. On disk, a certificate is stored as two files. One is public and contains only the public key. The second is secret and contains both keys. The two have the same filename, with the secret file adding "_secret". To exchange certificates, send the public file via some secure route. Certificates are not signed but are text files that can be verified by eye.
+
+> Certificates are stored in the ZPL (ZMQ RFC 4) format. They have two sections, "metadata" and "curve". The first contains a list of 'name = value' pairs, one per line. Values may be enclosed in quotes. The curve section has a 'public-key = keyvalue' and, for secret certificates, a 'secret-key = keyvalue' line. The keyvalue is a Z85-encoded CURVE key."
+
+What you would do in practice is generate certificates up-front (and CZMQ provides a simple tool to do this, in addons/makecert), and then put them carefully on each node in your network. It's like handing out neat little membership cards for an exclusive club, up front. Makes life easier for guests and security alike.
+
+In the Ironhouse example we'll see how to work with "real" certificates on disk, using a so-called "certificate store". However for this example, we can generate certificates on-the-fly, in memory, and pretend we got them from disk.
+
+We need a client certificate, a server certificate, and then we also have to pass the server's public key to the client. This is the total setup to use the Stonehouse pattern. CZMQ provides a zcert class that generates a new certificate, and which we can "apply" to a socket in order to enable it for CURVE security. Finally, we have to tell the client socket what our server public key is. Here are the relevant API calls:
+
+[[code]]
+//  Generate certificates at runtime, since this is a test
+zcert_t *client_cert = zcert_new ();
+zcert_t *server_cert = zcert_new ();
+char *server_key = zcert_public_txt (server_cert);
+...        
+//  Before binding the server
+zcert_apply (server_cert, server);
+zsocket_set_curve_server (server, 1);
+...
+//  Before connecting the client
+zcert_apply (client_cert, client);
+zsocket_set_curve_serverkey (client, server_key);
+...
+//  Destroy these in-memory objects when done
+zcert_destroy (&client_cert);
+zcert_destroy (&server_cert);
+[[/code]]
+
+The zcert_new() call generates a public/secret key pair. We can ornament that with metadata, e.g. name, email, and organization, which can be helpful when managing certificates. Metadata doesn't play any role in authentication however.
+
+++ The Ironhouse Pattern
+
+Now, let's explore full authentication of clients. I call this the Ironhouse pattern, just to remind us that security is never total or perfect. It's always about cost. Even an iron house may have holes in the floor, or the roof, and your security is only as good as the systems it runs on. If you run Ironhouse on a box with an insecure or outdated operating system, don't expect privacy.
+
+Here's the Ironhouse example:
+
+[[code type="example" title="Ironhouse Pattern" name="ironhouse"]]
+[[/code]]
+
+Ironhouse is very similar to Stonehouse except it uses a "certificate store". That is a directory somewhere on the server's file system that contains a set of client public certificates. This is the API we use:
+
+[[code]]
+//  Tell authenticator to use the certificate store in .curve
+zauth_configure_curve (auth, "*", ".curve");
+...
+//  Stick the client public certificate into the directory
+zcert_t *client_cert = zcert_new ();
+zcert_save_public (client_cert, ".curve/testcert.pub");
+[[/code]]
+
+For the client, nothing changes -- it's the same code as for Stonehouse, as you'd expect. If this wasn't clear already, the zauth object belongs to the server, not the client.
+
+A word about certificate stores. This is a CZMQ concept, and implemented by the zcertstore class. Normally you won't use that class directly, but like this example, allow the authenticator to manage it. All we do is (a) tell the authenticator what directory will hold certificates, and then make sure our clients' public certificates end up safely there.
+
+In practice a server application will be a long-running process, so the certificate store reloads itself automatically if there is a change. This means we can copy new certificates into it at any time, to allow new clients, or remove certificates to reject clients.
+
+Certificate filenames don't matter. Here we use "testcert.pub" but in practice I'd use a filename which is based of the certificate public key, for instance, to ensure it's unique. In our example we create the directory, and add some meta data, before saving the certificate:
+
+[[code]]
+//  Create the directory
+zsys_dir_create (".curve");
+zcert_set_meta (client_cert, "name", "Client test certificate");
+zcert_save_public (client_cert, ".curve/testcert.pub");
+[[/code]]
+
+When you save a certificate using the zcert_save_public (or zcert_save) method, it looks like this:
+
+[[code]]
+#   ****  Generated on 2013-09-19 21:25:34 by CZMQ  ****
+#   ZeroMQ CURVE Public Certificate
+#   Exchange securely, or use a secure mechanism to verify the contents
+#   of this file after exchange. Store public certificates in your home
+#   directory, in the .curve subdirectory.
+
+metadata
+    name = "Client test certificate"
+curve
+    public-key = "I7[{YV4[}q[9a)]b&d>bisoT]UXa/7b$Tp:6yoyq"
+[[/code]]
+
+In own applications I'm using $HOME/.curve to hold certificates, as zcert recommends, but you can put them anywhere. Some guidelines do apply:
+
+* A certificate produced by makecert has a secret and a public file. Never share the secret file with anyone.
+
+* When you transfer public certificates, use a secure route. If an attacker can modify this data without you knowing about it, they can construct a man-in-the-middle attack.
+
+* For the same reason, make sure public certificates are not writeable by anyone except the current user.
+
+++ The Ironhouse Pattern, Model 2
+
+When you read the examples so far, you might be tempted to copy the code for your own applications. However it's not meant for that. It doesn't have a clean separation into client and server, and doesn't do any error checking. Here's a reworking of the Ironhouse example that is much more explicit. It's also twice the amount of code:
+
+[[code type="example" title="Ironhouse Pattern, model 2" name="ironhouse2"]]
+[[/code]]
+
+Here we see how to save and load client certificates from disk, to create truly persistent certificates:
+
+[[code]]
+zcert_t *client_cert = zcert_new ();
+zcert_save (client_cert, "client_cert.txt");
+zcert_destroy (&client_cert);
+[[/code]]
+
+And then, in a different place and time, or at least a separate thread:
+
+[[code]]
+//  Load our persistent certificate from disk
+zcert_t *client_cert = zcert_load ("client_cert.txt");
+[[/code]]
+
+++ Wrapping Up
+
+OK, that's enough code. After half a dozen examples, we start to get code blindness. What is striking however is how short the code examples are, even in C. For me, this is success.
+
+There's one last thing I want to discuss about security, which is the constant harping on about "server" and "client", which you may know are not ZeroMQ native concepts at all. The closest we get in ZeroMQ is having one side binding to an endpoint, and the other side connecting to it.
+
+When using the PLAIN or CURVE security mechanisms (wood, stone, or iron), you can bind the client and connect the server. You can try this in stonehouse.c for example. Simply switch the bind and connect statements (change the socket arguments :) and observe that it still works. The server still authenticates the client.
+
+You'll get the best results by typing the code, because muscle memory is a fantastic thing for programming. But if you're in a hurry, [https://github.com/zeromq/czmq it is in the CZMQ project], in the examples/security directory. These examples are licensed under MIT/X11 so you can reuse the code in your own applications.
+
+Let me know how you get on. Comment below, or come to the [http://zeromq.org/docs:mailing-lists zeromq-dev mailing list]. If you need commercial support in using these new security tools, or you're an open source project that wants to use them, drop me an email at ph@imatix.com and tell me your use case.

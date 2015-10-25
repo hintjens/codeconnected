@@ -1,0 +1,158 @@
+While the ØMQ pub-sub pattern is well-known for being a one-way pattern, it does in fact support a two-way flow of information. SUB sockets (or more accurately, XSUB sockets) can send messages to XPUB sockets. This week, I'll post a series of short articles that cover different patterns—Meerkat, Census, and Repeater—we can build using this functionality. As usual, I'll demonstrate each pattern with code you can download and run.
+
++++ The Meerkat Pattern
+
+One of the common questions from ØMQ developers (until they learn that there's no good answer and retreat into a kind of Stockholmesque "if it hurts it must be for our own good" acceptance) is "how can a publisher know when subscribers are present?" However as I've written elsewhere, pain is not a good sign.
+
+[[f>image meerkats.jpg size="small"]]
+
+It is true that for certain use cases, the answer is, "you don't want to know". It's true that for very large scale publishers, the raw cost of tracking individual subscribers in real time is not worth the effort. The BBC doesn't wait until everyone's ready with their telly before starting Blue Peter. So, the argument goes, why should we?
+
+But I'm suspicious of people who tell me what I should think. Particularly since, as a writer, propaganda is //my job//. And I know just how much rubbish people say when they're being especially serious. But kidding aside, the question is valid, and the "no, you don't want to do this" answer seems bogus and somewhat lazy. We know that publishers can benefit greatly from tracking individual subscribers. This was after all the major improvement in version 3 of ØMQ: much faster PUB-SUB thanks to "upstreaming", where subscribers actually tell publishers what data they want.
+
+If it's good for XPUB and XSUB sockets, why not for applications too? This was the question that innocently entered my mind one spring morning in Brussels, as we watched yet another snowstorm unfold. Innocence is all relative, of course, as they say in Rome. The question hooked into some unfinished thoughts and formed a flash mob of irritation that forced me to stop working briefly on more interesting topics. The **Meerkat Pattern** is what came out.
+
+This is one of the real pleasures of using a technology: to twist and distort it into shapes its original designers never thought of, and see what comes out. So let's distort and abuse the XPUB-XSUB upstreaming functionality to answer that question and give publishers a way to know what subscribers are around.
+
+I once had a friend and mentor, the larger-than-life Leif Svalgaard, who would work secretly on some amazing code and then show the finished results to general astonishment. When we asked him how he did it, he invariably answered with a huge Santa Clause grin, palms up innocently, saying, "it's magic!" Once Leif wrote a tiny but working multitasking system for DOS over the weekend, just to disprove Microsoft's claims that OS/2 (yes, this was some time ago) needed 8 Megabytes of memory "because it did multitasking". As he started a compilation in one window, and edited a file in another, I asked him, "how did you do this?" "Ah, it's magic!" he answered.
+
+Incidentally, that tiny multitasking system (1,000 lines of x86 assembly) inspired my multithreading SMT kernel in 1995, which became the heart of our server technology and then OpenAMQ, which led the way to ZeroMQ. So it goes in the history of software, a chain of inspiration and culture leading back to the first time primitive man told his wife, "just going down to the cave to paint some pr0... ugh... hunting scenes, honey. BRB!"
+
+**Figure 1 - The Meerkat Pattern**
+[[=image fig1.png]]
+
+++++ Step 1: Counting Subscriptions
+
+What if a publisher (suitably wearing an "X" on its torso to mark it with XPUB superpowers) simply counted the number of subscriptions it received? Perhaps surprisingly, this works for all values of N on the condition that N is equal to one. To say this in English, an XPUB tracks subscriptions and only tells you of the first one. So, on to attempt 2.
+
+++++ Step 2: Using the Verbose Option
+
+A few months ago we added a neat little option (ZMQ_XPUB_VERBOSE) to XPUB sockets that disables its filtering of duplicate subscriptions. This now works for any number of subscribers. We use this as follows:
+
+[[div class="code"]]
+[[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]publisher [[span style="color:#666666"]]=[[/span]] zsocket_new (ctx, ZMQ_XPUB);
+zsocket_set_xpub_verbose (publisher, [[span style="color:#666666"]]1[[/span]]);
+zsocket_bind (publisher, [[span style="color:#BA2121"]]"tcp:@@//@@*:6001"[[/span]]);
+[[/div]]
+//fragments/xpub-verbose-option.c: Listing 1//
+
+However we still have a problem. Subscribers may subscribe any number of times. We need some devious trick to distinguish different kinds of subscriptions.
+
+++++ Step 3: Sending 'Special' Subscriptions
+
+My first idea was to use the empty subscription, but of course this doesn't play well with real use. Let's say I have two subscribers that subscribe to a series of topics:
+
+* A subscribes to "USD", "JPY", and "EUR"
+* B subscribes to "JPY" and "KRW"
+
+How do I know how many subscribers I have?
+
+My answer, which is not very beautiful but works, is to send a "special" subscription that doesn't match any real data but which tells my application what it needs to know:
+
+* A subscribes to "USD", "JPY", "EUR", and "Meerkat"
+* B subscribes to "JPY", "KRW", and "Meerkat"
+
+So this brings us to an example of Meerkat in action:
+
+[[div class="code"]]
+[[span style="color:#BC7A00"]]@@//@@{{@@  @@}}The Meerkat Pattern
+@@//@@
+@@//@@{{@@  @@}}In which we address the slow subscriber problem by asking for
+@@//@@{{@@  @@}}a show of hands before we start publishing.
+
+#include "czmq.h"[[/span]]
+
+[[span style="color:#008000"]]**static**[[/span]] [[span style="color:#B00040"]]void[[/span]]
+[[span style="color:#0000FF"]]publisher_task[[/span]] ([[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]args, zctx_t [[span style="color:#666666"]]*[[/span]]ctx, [[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]pipe)
+{
+{{@@    @@}}zctx_set_linger (ctx, [[span style="color:#666666"]]1000[[/span]]);
+{{@@    @@}}[[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]publisher [[span style="color:#666666"]]=[[/span]] zsocket_new (ctx, ZMQ_XPUB);
+{{@@    @@}}zsocket_set_xpub_verbose (publisher, [[span style="color:#666666"]]1[[/span]]);
+{{@@    @@}}zsocket_bind (publisher, [[span style="color:#BA2121"]]"tcp:@@//@@*:6001"[[/span]]);
+
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Calling thread tells us the population size//[[/span]]
+{{@@    @@}}[[span style="color:#B00040"]]char[[/span]] [[span style="color:#666666"]]*[[/span]]population [[span style="color:#666666"]]=[[/span]] zstr_recv (pipe);
+{{@@    @@}}[[span style="color:#B00040"]]int[[/span]] still_waiting [[span style="color:#666666"]]=[[/span]] atoi (population);
+{{@@    @@}}byte meerkat @@[]@@ [[span style="color:#666666"]]=[[/span]] { [[span style="color:#666666"]]1[[/span]], [[span style="color:#BA2121"]]'M'[[/span]], [[span style="color:#BA2121"]]'e'[[/span]], [[span style="color:#BA2121"]]'e'[[/span]], [[span style="color:#BA2121"]]'r'[[/span]], [[span style="color:#BA2121"]]'k'[[/span]], [[span style="color:#BA2121"]]'a'[[/span]], [[span style="color:#BA2121"]]'t'[[/span]] };
+{{@@    @@}}
+{{@@    @@}}[[span style="color:#008000"]]**while**[[/span]] (still_waiting) {
+{{@@        @@}}zframe_t [[span style="color:#666666"]]*[[/span]]frame [[span style="color:#666666"]]=[[/span]] zframe_recv (publisher);
+{{@@        @@}}[[span style="color:#008000"]]**if**[[/span]] ([[span style="color:#666666"]]![[/span]]frame)
+{{@@            @@}}[[span style="color:#008000"]]**break**[[/span]];{{@@              @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Interrupted//[[/span]]
+{{@@        @@}}[[span style="color:#008000"]]**if**[[/span]] (zframe_size (frame) [[span style="color:#666666"]]==[[/span]] [[span style="color:#008000"]]**sizeof**[[/span]] (meerkat)
+{{@@        @@}}[[span style="color:#666666"]]&&[[/span]]{{@@  @@}}memcmp (zframe_data (frame), meerkat, [[span style="color:#008000"]]**sizeof**[[/span]] (meerkat)) [[span style="color:#666666"]]==[[/span]] [[span style="color:#666666"]]0[[/span]])
+{{@@            @@}}still_waiting[[span style="color:#666666"]]@@--@@[[/span]];
+{{@@        @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Dump the frame contents for the benefit of the reader//[[/span]]
+{{@@        @@}}zframe_print (frame, [[span style="color:#008000"]]NULL[[/span]]);
+{{@@        @@}}zframe_destroy ([[span style="color:#666666"]]&[[/span]]frame);
+{{@@    @@}}}
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Now broadcast our message//[[/span]]
+{{@@    @@}}zstr_send (publisher, [[span style="color:#BA2121"]]"Hello, World!"[[/span]]);
+{{@@    @@}}zclock_sleep ([[span style="color:#666666"]]250[[/span]]);
+{{@@    @@}}zstr_send (pipe, [[span style="color:#BA2121"]]"DONE"[[/span]]);
+}
+
+[[span style="color:#408080"]][[span style="font-style:italic"]]@@//@@{{@@  @@}}The subscriber sends a "Meerkat" subscription and then
+@@//@@{{@@  @@}}any other subscriptions it wants:[[/span]][[/span]]
+
+[[span style="color:#008000"]]**static**[[/span]] [[span style="color:#B00040"]]void[[/span]]
+[[span style="color:#0000FF"]]subscriber_task[[/span]] ([[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]args, zctx_t [[span style="color:#666666"]]*[[/span]]ctx, [[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]pipe)
+{
+{{@@    @@}}[[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]subscriber [[span style="color:#666666"]]=[[/span]] zsocket_new (ctx, ZMQ_XSUB);
+{{@@    @@}}zsocket_connect (subscriber, [[span style="color:#BA2121"]]"tcp:@@//@@localhost:6001"[[/span]]);
+
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Tell publisher we're here//[[/span]]
+{{@@    @@}}byte meerkat @@[]@@ [[span style="color:#666666"]]=[[/span]] { [[span style="color:#666666"]]1[[/span]], [[span style="color:#BA2121"]]'M'[[/span]], [[span style="color:#BA2121"]]'e'[[/span]], [[span style="color:#BA2121"]]'e'[[/span]], [[span style="color:#BA2121"]]'r'[[/span]], [[span style="color:#BA2121"]]'k'[[/span]], [[span style="color:#BA2121"]]'a'[[/span]], [[span style="color:#BA2121"]]'t'[[/span]] };
+{{@@    @@}}zmq_send (subscriber, [[span style="color:#666666"]]&[[/span]]meerkat, [[span style="color:#008000"]]**sizeof**[[/span]] (meerkat), [[span style="color:#666666"]]0[[/span]]);
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Subscribe to everything as well (empty subscription)//[[/span]]
+{{@@    @@}}zmq_send (subscriber, [[span style="color:#666666"]]&[[/span]]meerkat, [[span style="color:#666666"]]1[[/span]], [[span style="color:#666666"]]0[[/span]]);
+{{@@    @@}}
+{{@@    @@}}[[span style="color:#B00040"]]char[[/span]] [[span style="color:#666666"]]*[[/span]]hello [[span style="color:#666666"]]=[[/span]] zstr_recv (subscriber);
+{{@@    @@}}puts (hello);
+{{@@    @@}}free (hello);
+}
+
+[[span style="color:#408080"]]//@@//@@{{@@  @@}}The main task starts publisher task and then the subscribers://[[/span]]
+
+[[span style="color:#B00040"]]int[[/span]] [[span style="color:#0000FF"]]main[[/span]] ([[span style="color:#B00040"]]void[[/span]])
+{
+{{@@    @@}}zctx_t [[span style="color:#666666"]]*[[/span]]ctx [[span style="color:#666666"]]=[[/span]] zctx_new ();
+
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Size of target population//[[/span]]
+{{@@    @@}}srand (([[span style="color:#B00040"]]unsigned[[/span]]) time ([[span style="color:#008000"]]NULL[[/span]]));
+{{@@    @@}}[[span style="color:#B00040"]]int[[/span]] population [[span style="color:#666666"]]=[[/span]] randof ([[span style="color:#666666"]]10[[/span]]) [[span style="color:#666666"]]+[[/span]] [[span style="color:#666666"]]1[[/span]];
+{{@@    @@}}
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Start publisher task//[[/span]]
+{{@@    @@}}[[span style="color:#B00040"]]void[[/span]] [[span style="color:#666666"]]*[[/span]]pipe [[span style="color:#666666"]]=[[/span]] zthread_fork (ctx, publisher_task, [[span style="color:#008000"]]NULL[[/span]]);
+{{@@    @@}}zstr_send (pipe, [[span style="color:#BA2121"]]"%d"[[/span]], population);
+{{@@    @@}}
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Start target population//[[/span]]
+{{@@    @@}}[[span style="color:#008000"]]**while**[[/span]] (population[[span style="color:#666666"]]@@--@@[[/span]])
+{{@@        @@}}zthread_fork (ctx, subscriber_task, [[span style="color:#008000"]]NULL[[/span]]);
+
+{{@@    @@}}[[span style="color:#408080"]]//@@//@@{{@@  @@}}Wait for publisher to complete//[[/span]]
+{{@@    @@}}free (zstr_recv (pipe));
+
+{{@@    @@}}zctx_destroy ([[span style="color:#666666"]]&[[/span]]ctx);
+{{@@    @@}}[[span style="color:#008000"]]**return**[[/span]] [[span style="color:#666666"]]0[[/span]];
+}
+[[/div]]
+//meerkat.c: Meerkat Pattern//
+
+[https://gist.github.com/hintjens/5248065 Get the code.]
+
+When you run this code you'll see it starts a random number of subscribers, waits until they all wake up, and then sends "Hello, World" to everyone.
+
+++++ Step 4: Ridiculous Optimization
+
+If you look a little closer at the code you'll see a possible optimization. Instead of sending a //subscription// message to signal presence, how about an //unsubscription// message?
+
+It's a great idea except (at time of writing), XPUB sockets don't verbosely send you unsubscribe messages. There are reasons for this (there are //always// reasons, he said darkly, to no-one in particular) but it's minor. Perfection is, sometimes, just a waste of time, and sending subscribe messages seems fine.
+
+++++ Step 5: Robustness
+
+The Meerkat example will occasionally fail in the real world because it doesn't distinguish between a subscriber saying "I'm here" for the first time from one who comes back several times. We're basically counting the heads that pop-up, not the bodies that are really present on the field. The same head can pop-up over and over, and like idiots we'll count it multiple times.
+
+There's an answer—there always is—but it makes things more complex. Each subscriber has to identify itself uniquely and the server has to track this. Subscribers could for instance send a UUID as part of their "special" subscription. The server would track these in a hash table, and count only new entries.
+
+It's the kind of boring grunt work we invented ØMQ to get away from, so I'm not going to feed you an example. Let's just agree that making things more complex is easy. My next article will cover the Census pattern, which extends Meerkat into a group query pattern.

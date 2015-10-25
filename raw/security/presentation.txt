@@ -1,0 +1,188 @@
+What's the Problem?
+
+ZeroMQ (ØMQ) defined a new product category
+Message queuing & routing stacks
+JeroMQ, NullMQ, Nano, netty-zmtp, ezmtp
+All have the same problem: clear-text
+Not safe to use on public infrastructure
+
+What do People Do?
+
+Many apps just use clear text
+Clearly not acceptable for sensitive data
+Salt Stack has its own security system
+Already cracked (chicken-salt)
+IPython uses SSH + HMAC digests
+Has several plausible vulnerabilities
+
+Works in Progress
+
+TLS encryption above libzmq (Barber)
+TLS transports for libzmq (Young, Naudé)
+DTLS transport for libzmq (Cocagne)
+May deliver, but...
+What about interoperability?
+
+The Right Solution
+
+Security at the protocol level (ZMTP)
+Extensible security (like SASL)
+Several example mechanisms
+Easy to plug new ones into libzmq
+Perhaps exposed as e.g. dtls://
+
+What's SASL?
+
+IETF's solution for extensible security
+We used this when designing AMQP
+Client and server negotiate a "mechanism"
+Mechanism does the actual security
+IETF as usual makes it... complex
+We can do it somewhat simpler
+
+The Security Handshake
+
+Client: HELLO
+Server: WELCOME (mechanism M)
+Client: INITIATE (mechanism M)
+Server: READY
+Client: MESSAGE | Server: MESSAGE
+
+What is "Secure"?
+
+Data cannot be tapped (encrypted)
+or created fraudulently (authentic)
+or altered
+or replayed
+Keys cannot be stolen
+
+Basic State of the Art
+
+Mechanisms must be open ended
+Allows evolution of security over time
+Processing HELLO command must be cheap
+Prevents denial-of-CPU attacks
+HELLO must be larger than WELCOME
+Prevents amplification attacks
+Send no metadata until INITIATE/READY
+Prevents leak of knowledge about peer
+
+Advanced State of the Art
+
+Perfect forward security
+Data cannot be decrypted even with private keys
+Resists man-in-the-middle manipulation of keys
+Clients cannot be identified
+Client public keys are sent encrypted
+Resists traffic-analysis attacks
+Randomize message sizes & frequencies
+
+Meet CurveCP (Bernstein)
+
+"Usable Security for the Internet"
+From author of NaCl (=> libsodium)
+Encryption and authentication over UDP
+Also does recovery from packet loss
+Also does a bunch of other stuff
+http://curvecp.org
+
+Some CurveCP Internals
+
+Elliptic curve encryption, very fast
+Creates short-term keys for each connection
+Unique nonces for each command
+Achieves "advanced state of the art"
+Except defeating traffic analysis
+Which we can add ourselves
+
+Why NaCl is Wonderful
+
+Perfectly simple API
+Fast and robust
+Preselected key sizes & algorithms
+Packaged as libsodium
+Easy to install, learn, and use
+
+Why CurveCP won't happen
+
+Tries to do too much, too soon
+The software is complex to use
+Does not "play nice" with existing standards
+Utterly incompatible with SASL, TCP
+Remixed into more plausible MinimalT
+
+Apart from that, Very Nice!
+
+I took CurveCP's security handshake
+Simplified it and cleaned it up
+Made it transport neutral
+Wrote down as a single protocol document
+http://rfc.zeromq.org/spec:26/CURVEZMQ
+
+Meet CurveZMQ 
+
+An Abstract Security Mechanism
+Specified as a client-server protocol
+Any transport (even avian carrier)
+TCP if we build this into ZMTP
+Or ZeroMQ at application level
+http://curvezmq.org
+
+Meet ZMTP
+
+The ZeroMQ Message Transport Protocol
+Wire protocol for ZeroMQ over TCP
+Fifth RFC now in drafting stage
+In ZeroMQ, JeroMQ, NetMQ, netty-zmtp, ...
+Version 3.0 is quite a big deal
+http://rfc.zeromq.org/spec:23/ZMTP
+
+What's New in ZMTP 3.0?
+
+Extensible security mechanisms
+Extensible connection metadata
+Endpoint resources (for port sharing)
+Better backwards version detection
+Explicit socket type semantics
+
+ZMTP's security mechanisms
+
+NULL is just that, empty
+PLAIN does clear-text authentication
+Test clients vs. production systems
+CURVE does CurveZMQ security
+Fully encrypted and authenticated
+<Insert your own here>
+
+libzmq already runs ZMTP 3.0
+
+Git master does NULL and PLAIN
+Full backwards compatibility
+Supports extensible mechanisms
+We're now working on CURVE
+Next: DTLS, ...?
+
+Meet ZAP
+
+The ZeroMQ Authentication Protocol
+Extensible authentication services
+Using ZeroMQ request-reply protocol
+PAM, LDAP, Kerberos, passwd, etc.
+libzmq implements ZAP 1.0
+http://rfc.zeromq.org/spec:27/ZAP
+
+Get involved
+
+Read the RFCs on rfc.zeromq.org
+Come to Brussels on 21 & 22 June 2013
+For ZeroMQ Developers' Meetup
+Contact me at ph@imatix.com
+Talk to us on the zeromq-dev list
+
+Who are we?
+
+iMatix makes messaging products
+Distributed systems since 1991
+Original designers of AMQP (2004-07)
+Backers of ZeroMQ community (2007-)
+Authors of most ZeroMQ RFCs

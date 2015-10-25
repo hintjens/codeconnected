@@ -1,0 +1,263 @@
+In the ongoing search for a new certificate format for ZeroMQ, I kicked off a [http://thread.gmane.org/gmane.network.zeromq.devel/20532 nice lively thread on zeromq-dev] with some to and for, little agreement, and lots of ideas. In this article I'll present Design Iteration 1, a strawman that people can beat up.  The format is inspired by the [http://www.ietf.org/rfc/rfc4716.txt SSH2 public key format].
+
+++ Goals and Requirements
+
+These are the requirements I wrote down when designing this certificate format:
+
+* The core goal is to give people a format they can reuse, rather than ask every project that uses ZeroMQ security to invent their own format.  A single format lets different applications //interoperate//, and lets us make a few 10-day projects that work together instead of 100 2-day projects that cannot.
+
+* The format we use has to be //simple// and //human readable//. It has to be //portable// to any system and //obvious// to implement, and //language-neutral//.
+
+* A certificate must be capable of carrying at least the CURVE security keys, but should be //extensible// to any security mechanism, given that ZeroMQ is itself extensible to new security mechanisms.
+
+* A certificate may be //symmetrically encrypted with a passphrase//, if it holds secret information. We should use a standard encryption algorithm to ensure interoperability.
+
+* A certificate may be //asymmetrically encrypted to a recipient//, when it will be sent across an untrusted channel. We should use a standard authentication and encryption mechanism to ensure interoperability.
+
+* The certificate must be //safe to copy/paste into email//, and it must be possible to //automatically extract one or more certificates// from an email message.
+
+* The certificate should be //easy to verify// by hand (e.g. over a voice call), using a text fingerprint.
+
+++ Use Cases
+
+These are the use cases I know about for the CURVE security mechanism:
+
+* A server generates a public + secret keypair, stores the secret key securely, using a passphrase, and stores the public key in clear text. This creates two certificate files, one meant to be kept locally, and one meant to be published.
+
+* A client receives a public certificate from a server. It stores this in a location where it can access it at run time, when it needs that server's public key.
+
+* A client generates a public + secret keypair, stores the secret key securely, using a passphrase, and encrypts and signs the public key from its own secret key to the server's public key.
+
+* A server receives a signed and encrypted public certificate from a client. It stores this in a location where it can access it at run time, when the client makes a new connection.
+
+++ Argumentation
+
++++ One Envelope, many Contents
+
+To support arbitrary security mechanisms, it seems useful to split the envelope (how the certificate is represented) from the content (the security keys and metadata). Specifically:
+
+* The envelope will always be in clear text, while the content may be encrypted.
+* The envelope will have a small set of standard properties, while the content should be fully extensible.
+* The envelope will rarely change, while the content will change frequently over time as we refine our security mechanisms.
+* We would create and process the envelope, and contents, at two different layers, a generic certificate codec, and a specific layer for each different mechanism.
+
+[[code type="textdiagram" title="Two-layer Certificate"]]
+#-----------#
+|  Content  |   Processed by mechanism.
++-----------+
+|  Envelope |   Processed by generic codec
+#-----------#
+[[/code]]
+
+So, in this article I'll aim towards (a) a certificate envelope format and (b) a certificate content format for CURVE.
+
++++ Email Armoring
+
+This is a common problem with a well-known solution. To let us copy/paste a certificate into an email, and extract certificates from emails, we put a special marker before and after the certificate. Let's use this style:
+
+[[code]]
+-----BEGIN ZEROMQ CERTIFICATE-----
+...
+-----END ZEROMQ CERTIFICATE-----
+[[/code]]
+
+Further, lines must be at most 72 characters long, and we should use only 7-bit ASCII.
+
++++ Envelope Format
+
+In the envelope we will want to note:
+
+* The version number for the envelope, so we can assure forward compatibility.
+* The mechanism name, so that the codec can pass decrypted content to the correct mechanism.
+* Whether the content is encrypted, and if so, using what algorithm.
+* Whether the content is signed, and if so, using what algorithm and public key.
+
+A simple and well-understood format for the envelope is HTTP-style headers, e.g.:
+
+[[code]]
+Version: 0.1
+Mechanism: CURVE
+Comment: The certificate content is signed by the sender using their s\
+ecret key and encrypted to the recipient's public key. We put both pub\
+lic keys into the envelope so the reader can decrypt using the right s\
+ecret key. Here, the "Content-security" header is actually redundant.
+Content-security: signed
+Content-signed-by: Yne@$w-vo<fVvi]a<NY6T1ed:M$fCG*[IaLV{hID
+Content-signed-to: rq:rM>}U?@Lns47E1%kR.o@n%FcmmsL/@{H8]yf7
+[[/code]]
+
+Note that we're splitting long lines at column 72 and using a backwards slash to indicate that the line continues. This makes the text safe to send in emails.
+
++++ Content Format
+
+ZeroMQ is notable for transporting opaque frames without trying to define their internal structure. We can do the same here and reuse the successful pattern where the content consists of zero or more opaque frames. Having said that, we should also standardize the content for at least the CURVE mechanism we want to support today. Presumably in two separate RFCs.
+
+We will want a consistent syntax for content framing so the codec can do its work. Since we're building a text format, we can define a frame as a single line of text. We can use the same continuation line style as we did with headers.
+
+In ZeroMQ's security model, all mechanisms have metadata, which consists of zero or more name=value pairs. We can specify that the metadata sits in the first frame, and that other mechanism-specific properties follow in further frames. To indicate an empty frame, let's use a single hyphen, "-".
+
+Here is the sketch of a PLAIN certificate with metadata, name, and password as three frames:
+
+[[code]]
+-----BEGIN ZEROMQ CERTIFICATE-----
+Version: 0.1
+Mechanism: PLAIN
+Uuid=b19e19a0-34aa-11e3-aa6e-0800200c9a66;Date-created=14 October, 2013\
+;Created-by=Pieter Hintjens;Email=ph@imatix.com
+admin
+topsecret
+-----END ZEROMQ CERTIFICATE-----
+[[/code]]
+
+Note that the metadata is using a //name=value// format, with semicolons to separate pairs. In ZMQ RFC 23, metadata names are case-insensitive, so we'll use that convention here too.
+
+Overall this looks somewhat like the SSH 2 public key format ([http://www.ietf.org/rfc/rfc4716.txt IETF RFC 4716]), but is adapted to the ZeroMQ extensible security model. As in IETF RFC 4716 we do not use a blank line between headers and content since it serves no purpose. The headers continue as long as there is a line containing ": ".
+
++++ Binary Content Encoding
+
+When we encrypt the content, all frames have to be encrypted the same way. We could encrypt each frame individually but this exposes the frame structure to anyone who reads the certificate. Instead, we'll write the whole content (all frames) into a buffer, including line endings, and then encrypt that whole buffer. We will then use the ZMQ RFC 32 (Z85) encoding to represent the binary data safely as text. Z85 is more compact than Base16 or Base64, and the ZeroMQ core API provides encoding and decoding methods. Like all ASCII armoring, Z85 requires padding. To allow safe decoding of Z85 data we need to know the size of the data, excluding any padding. For double-checking we also need the padded length, i.e. the actual number of characters in the encoded content.
+
+To authenticate a certificate, we need to verify the encrypted content, e.g. over the phone. This is not practical for typically long encrypted content. We thus use the SSH standard for generating an MD5 digest of the content. MD5 has known security weaknesses: you can modify a content and generate the same hash, if you can insert 128 bytes of data at some point. Since our encrypted content has a structure that is unknowable without decryption, it cannot be successfully modified. Thus, MD5 provides an acceptable signature. We will use the SSH-style signature consisting of a sequence of 16 octets printed as lower-case hexadecimal and separated by colons.
+
+We can place the content sizes and signature in a first frame, and the armored text into a second frame. As before, we can continue long frames over multiple lines. So this gives us, for example:
+
+[[code]]
+381,384,c1:b1:30:29:d7:b8:de:6c:97:77:10:d7:46:41:63:87
+nP2U)xK@r8zF9)4zF78kwNPQ?xDQ]9AV!^kzE[2mv}xX5x>z6?vru66w]zZbvrrS7z/M$7w\
+PzY-q7J?YazUX3yH}30z!pb2ax@J3Bz%n]fly(FwNPa4xkI6{wId[wxd)[mvqYTezE){lz/\
+PRCDs.bnze?gswP?T3fetjsgCQ7<x>7Y%y?X67y<vdBxMvV)wft/daBmQtz/6FCwmY{&aA}\
+KwxDRwmzdK&izY&FawftG5AX5tHx([DkwGUz]A+e*0wO#PvayPd#az+$rB0bykazCv$vrj4\
+znP2U)xLzJgvrcE7v@bZ0nHFs<aAhvjB7GlhayMylBAg/laz>L8aARp9BrCKlz/xJ7ay!?$\
+ayX[<Bs[WUra]?=w]zZbvrrSaB0a}2B7F(8z/cXtxK@q<xMOuniXJdgCxUVNwPRJpz/PFzA\
++n/mA+n/rh.^iyBA?)Iq=ujxaAhEjy?Wx4yH}=lw]zZbvrt^c3ig5a
+[[/code]]
+
+To ensure that the same content survives decoding and re-encoding across multiple platforms, we will specify that the buffered content may only contain LF as its end of line marker. Carriage return characters in the decoded content should be treated as a fatal error, and the certificate rejected.
+
+++ Technical Proposal - Certificate Envelope Format
+
++++ Syntax and Grammar
+
+Here's a [http://en.wikipedia.org/wiki/Augmented_Backus%E2%80%93Naur_Form ABNF grammar] for the certificate envelope format:
+
+[[code]]
+certificate = begin *header content end
+
+begin = "-----BEGIN ZEROMQ CERTIFICATE-----" eoln
+eoln = CR | LF | CRLF
+
+header = header-name ": " header-value eoln
+header-name = defined-header / extension-header
+defined-header = "Version"
+               / "Mechanism"
+               / "Content-security"
+               / "Content-signed-by"
+               / "Content-signed-to"
+               / "Comment"
+extension-header = "X-" 1*62(LETTER / DIGIT / "-")
+header-value = *header-cont header-last
+header-cont = 1*CHAR "\" eoln
+header-last = 1*CHAR eoln
+
+content = *clear-frame / content-crypt
+clear-frame = "-" / (*clear-cont clear-last)
+clear-cont = 1*71CHAR "\" eoln
+clear-last = 1*72CHAR eoln
+
+content-crypt = length-frame armored-frame
+length-frame = 1*DIGIT "," 1*DIGIT "," signature
+signature = 15(signature-octet ":") signature-octet
+signature-octet = 2(DIGIT / "a" / "b" / "c" / "d" / "e" / "f" )
+
+armored-frame = *armored-cont armored-last
+armored-cont = 1*71armored-char "\" eoln
+armored-last = 1*72armored-char eoln
+armored-char = DIGIT / LETTER
+             / "." / "-" / ":" / "+" / "=" / "^" / "!" / "/"
+             / "*" / "?" / "&" / "<" / ">" / "(" / ")" / "["
+             / "]" / "{" / "}" / "@" / "%" / "$" / "#"
+
+end = "-----END ZEROMQ CERTIFICATE-----" eoln
+[[/code]]
+
+Notes on this syntax:
+
+* Header names are case-insensitive, while header values are case-sensitive.
+* The order of headers is not relevant except that a second header with the same name as the first will override the first header.
+* Header values are limited to 1,024 characters. RFC 4716 allows quoted values but this adds nothing so I've not allowed that.
+* The content starts on the first line not containing ": ".
+
++++ The Version Header
+
+Specifies the version of the certificate format used. This header is mandatory. It may have these values:
+
+* 0.1 - specifies draft version 1. Draft versions do not provide any guarantee of backwards compatibility.
+
++++ The Mechanism Header
+
+Specifies the security mechanism that the certificate implements. This header is mandatory. It may have these values:
+
+* PLAIN - implements the ZeroMQ PLAIN mechanism, as defined by ZMQ RFCs 24.
+* CURVE - implements the ZeroMQ CURVE mechanism, as defined by ZMQ RFCs 25 and 26.
+
+The content depends on the mechanism and will be defined separately for each standardized mechanism.
+
++++ The Content-security Header
+
+Specifies whether the content is encrypted and how. This header is optional. It may have these values:
+
+* clear - the content is carried as clear text.
+* password - the content is encrypted using a symmetric key derived from a user-supplied password, using the scrypt algorithm. //Note: this needs more study and explanation.//
+* signed - the content is authenticated and encrypted using the {{crypto_box}} function of NaCl or libsodium.
+
+If the Content-signed-by and Content-signed-to headers are present, Content-security defaults to "signed", else to "plain".
+
++++ The Content-signed-by Header
+
+When Content-security is "signed", specifies the sender's public key used to authenticate the content. The key is provided in Z85 format and must be 40 characters long. The recipient uses this to authenticate the certificate content (not the certificate itself, which must be authenticated by some other channel).
+
++++ The Content-signed-to Header
+
+When Content-security is "signed", specifies the recipient's public key used to encrypt the content. The key is provided in Z85 format and must be 40 characters long. The recipient uses this to find the correct secret key to decrypt the content.
+
++++ The Comment Header
+
+Contains a user-specified comment. The comment MAY be displayed when using the key. The comment MUST be stored with the certificate and copied if the certificate is recreated on disk.
+
++++ Validating a Certificate
+
+When reading a certificate, these are the minimum set of validations the code should do. A certificate that fails any of these checks can be considered invalid:
+
+* The certificate has valid begin and end lines.
+* The version and mechanism headers are present, and have valid values.
+* The content, if encrypted, has a valid size and fingerprint.
+
+++ Technical Proposal - PLAIN Certificate Content Format
+
+The PLAIN mechanism uses these frames:
+
+* Frame 1 is metadata, as with all mechanisms.
+* Frame 2 is the username.
+* Frame 3 is the password.
+
+A PLAIN certificate:
+
+* MAY use signed content security when it is sent across insecure channels.
+
+++ Technical Proposal - CURVE Certificate Content Format
+
+The CURVE mechanism uses these frames:
+
+* Frame 1 is metadata, as with all mechanisms.
+* Frame 2 is the public key, and is always present.
+* Frame 3 is the matching secret key, and is optional.
+
+A CURVE certificate:
+
+* MUST use signed content security, and MUST not contain a secret key, when it is sent across insecure channels.
+* MAY use password security, when it is held for a peer's own use.
+* MUST use clear security when it is meant to be published openly to all recipients.
+
+++ Conclusions
+
+I've presented a hopefully simple certificate format that can store anything we need to implement ZeroMQ mechanisms at server or client, and which can be extended to new mechanisms. What's missing here is some proposal for standard filenames and certificate locations on disk. This should be part of a standard specification, I think.

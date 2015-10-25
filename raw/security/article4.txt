@@ -1,0 +1,201 @@
+In [/blog:36 the previous article] in this series, "Securing ZeroMQ", I showed a proof-of-concept for CurveZMQ. Now we're moving that into the ZeroMQ protocol, ZMTP. It's not a small change. You can't just sprinkle security over a protocol like chocolate chips onto pancakes. It means a new protocol, and this gives us a chance to address other problems with ZMTP. The result is [http://rfc.zeromq.org/spec:23 ZMTP 3.0]. In this article I'll explain ZMTP 3.0. If you never read the 1.0 or 2.0 spec, don't worry, I'll cover those briefly too.
+
+[[toc]]
+
+++ Real Protocols are Worth It
+
+ZeroMQ used to have a sweet but unrealistic story: "our API looks like plain sockets, and we have practically no protocol". As it turns out, this was great marketing but not great technical design. The plain BSD socket API doesn't work for messaging (Contexts? Multipart messages? Zero-copy? Events? Threads?), and a non-protocol doesn't provide the number one guarantee users want, which is interoperability (you need version numbers).
+
+ZMTP 1.0 was simple: each peer connected and then started blasting messages to each other. This is the protocol that libzmq v2.x speaks. The libzmq v3.1 release speaks a dialect of this protocol where subscribers send subscriptions upstream to publishers but still has no versioning. So you can't mix libzmq v2.x and v3.1 pub-sub on the same network.
+
+We designed and implemented ZMTP 2.0 about a year ago. It added version numbering, and fixed the framing to be more sensible. This is the protocol the current libzmq v3.2 speaks (it will also downgrade to speak to older 2.x peers). It was a minimal change, and didn't address a bunch of other problems in ZMTP.
+
+By 2013 it was clear that the number one problem with ZMTP is the lack of security. As I've shown in previous articles, it's not technically so difficult. It just needs to be done. At the same time, since adding security means big changes, we (Martin Hurton and myself) decided to address a few of the other long-standing problems in the protocol. These are mostly just questions the protocol should answer, but didn't.
+
+As you read these changes, understand the [http://hintjens.com/blog:9 "Cheap and Nasty"] pattern. We connect once, and then exchange millions of messages over hours or days. The message transfer is asynchronous, changes very little over time, and has to be as efficient as possible. But creating a connection is synchronous, changes a lot over time, and efficiency is utterly irrelevant.
+
+When you get this, you begin to see how to design what I'd consider a real messaging protocol. It breaks into two parts: a chatty negotiation at the start, and a high-speed asynchronous data stream thereafter. The negotiation needs to define commands with structure, and extensibility in the form of dictionaries (binary, or text, it doesn't really matter). ZMTP 2.0 didn't even start to go into this direction. In fact it broke that pattern by for instance sending meta data (identities and subscriptions) as messages.
+
+++ Goals
+
+A good way to understand ZMTP is to start with a plain TCP connection and then see what problems we need to solve in order to get a working message transport:
+
+* TCP carries a stream of bytes with no delimiters, but we want to send and receive discrete messages. Thus, ZMTP reads and writes //frames// consisting of a size and a body.
+
+* We need to carry metadata on each frame (such as, whether the frame is part of a multipart message, or not). ZMTP provides a //flags// field in each frame for metadata.
+
+* We need to be able to talk to older implementations, so that our framing can evolve without breaking existing implementations. ZMTP defines a //greeting// that announces the implemented version number, and specifies a method for version negotiation.
+
+* We need security so that peers can be sure of the identity of the peers they talk to, and so that messages cannot be tampered with, nor inspected, by third parties. ZMTP defines a //security handshake// that allows peers to create a secure connection.
+
+* We need a range of security protocols, from clear text (no security, but fast) to fully authenticated and encrypted (secure, but slow). Further, we need the freedom to add new security protocols over time. ZMTP defines a way for peers to agree on an extensible //security mechanism//.
+
+* We need a way to carry metadata about the connection, after the security handshake. ZMTP defines a standard set of //metadata properties// (socket type, identity, etc.) that peers exchange after the security mechanism.
+
+* We want to allow multiple tasks to share a single external unique interface and port, to decrease system administration costs. ZMTP defines a //resource// metadata property that lets any number of tasks share a single interface and port.
+
+++ Overall Behavior
+
+A ZMTP connection goes through these main stages:
+
+* The two peers agree on the version and security mechanism of the connection by sending each other data and either continuing the discussion, or closing the connection.
+* The two peers handshake the security mechanism by exchanging zero or more commands. If the security handshake is successful, the peers continue the discussion, otherwise one or both peers closes the connection.
+* Each peer then sends the other metadata about the connection as a final command. The peers may check the metadata and each peer decides either to continue, or to close the connection.
+* Each peer is then able to send the other messages. Either peer may at any moment close the connection.
+
+++ Version Negotiation
+
+ZMTP 3.0 makes it much clearer how to do version negotiation. Each peer sends part of the greeting, and the higher version number can decide to downgrade to the lower version number. Thus implementations can choose to be backwards compatible (as libzmq is), but do not need to try to be forwards compatible (which is kind of hard). If you're a v3.0 peer and you get a greeting from a v4.0 peer, you just continue. If the 4.0 peer doesn't want to downgrade to your protocol, it'll close the connection.
+
+++ Commands, Messages and Frames
+
+Following the greeting, which has a fixed size of 64 octets, all further data is sent as size-specified frames. //Command frames// are used in the security handshake, and //message frames// are used to carry clear text application data. Commands always consist of a single frame. Messages consist of one or more frames.
+
+A ZMTP connection is either clear text, or encrypted, according to the security mechanism. On a clear text connection, message data is always sent as message frames, using a single consistent format, so that traffic analysis tools don't need to know the specific details of a clear text mechanism. On an encrypted connection, message data is always encoded as commands so that wire analysis is not possible. (You'll never see message frames on a secure connection, period.)
+
+The frame has the same format as in v2.0 (like I said, the asynchronous high-volume part of a protocol rarely changes once you get it right). It has a 1 byte flags field, followed by one or eight bytes of size, followed by body data. The only change we made in v3.0 was to add another flag bit to mark command frames.
+
+People have proposed various other flag fields in the past, e.g. marking the first and last frame of a message rather than "more". Or, adding a "label" bit to mark message envelopes separately from message content (this would get rid of the null delimiter frame that request-reply still uses).
+
+Right now, ZMTP still doesn't know much about actual socket semantics, but we could start to add this. I'd like, for example, to be more explicit about XSUB/XPUB subscribe and unsubscribe commands, which are now sent as messages with a special first byte. We could also do heartbeating and more. Actually it's not hard to add features. The real cost is not even implementing them, it's ensuring existing applications can migrate safely onto new stacks.
+
+++ Authentication and Confidentiality
+
+Now we come to the meat of ZMTP 3.0, which is security. More specifically, do we know who we're talking to, and are our conversations fully private?
+
+Making secure protocols is complex, dangerous, and thankless work unless you find a way to cheat and make it all Someone Else's Problem. For ZMTP I borrowed from the IETF's Simple Authentication and Security Layer (SASL), aka [http://tools.ietf.org/html/rfc4422 RFC 4422], and the NaCl [http://curvecp.org CurveCP security handshake]. (I've explained my proposal for creative abuse of CurveCP in previous articles.)
+
+If you haven't studied SASL, and you care even a little about security protocols, you should go off and read my latest book, called "SASL Made Simple" (1,350 pages, from iMatix University Press, $95.50 plus S&H). Just kidding... we can boil SASL down to a few key design elements:
+
+* The server proposes, and the client accepts, a "security mechanism", which is a string.
+* The implementations use the security mechanism to lookup a library that implements it.
+* The server and client exchange challenges and responses, which are binary blobs.
+* These blobs are passed to the security library, which digests them and possibly produces a new challenge or response.
+* Eventually the security library at each side says, "OK, ready", and the server and client can now communicate.
+
+It's a little more subtle than this, but that's the basic idea. After the two peers shake hands, they can send each other messages encrypted by the security library. Message I/O is still handled by the same code, with the security library acting as a filter (it encodes and decodes messages as needed).
+
+What SASL does is pretty magic. First, we can add security mechanisms arbitrarily. The mechanism I want to use for ZMTP is CurveZMQ, but perhaps someone else will make a DTLS mechanism. Remember, each mechanism is a plug in library that doesn't need to know how data gets passed around. It takes blobs, produces blobs, and holds state about the connection. In my [/blog:36 previous article] I showed how a such a filter works.
+
+Splitting the security work off makes it much easier to solve. We can test the mechanisms in isolation, before we plug them into real messaging. It also leaves the protocol totally naive about security. That means that as we switch to newer, faster security models, we don't have to change the protocol.
+
+A peer announces precisely one security mechanism, unlike SASL, which lets servers announce multiple security mechanisms. Security in ZMTP is //assertive// in that all peers on a given socket have the same, required level of security. This prevents downgrade attacks and simplifies implementations.
+
+When we use this approach, every connection always uses a security mechanism. Of course for most traffic will still be clear text. So ZMTP comes with three mechanisms: NULL (no security), PLAIN (clear text authentication) and CURVE (full security). PLAIN is there for two reasons. One, it provides a decent model for other mechanisms. I'll explain that model in a tick. Two, clear text authentication is pretty useful on internal networks. You don't want that test client connecting to the production server and sending 1M test messages by accident.
+
+++ The NULL Security Mechanism
+
+The NULL mechanism is easiest to understand - it gives us pretty much what we already have with ZMTP 2.0. The big difference is that there's an explicit READY command to send metadata (what you'd call "headers" in HTTP). Metadata is one of those things you really, //really// want to send in an extensible dictionary, since this is where 80% of the experimentation and profit comes from in protocols.
+
+In the NULL mechanism, each peer sends off a READY to the other, and can then send or receive messages. They can check each others' metadata, e.g. to validate socket types. If either peer doesn't want to continue it simply closes the connection. 
+
+There's something about designing protocols to work like real human interactions that pleases me, and feels right. So there's no error reporting in ZMTP. If the peer closes the connection during handshaking, that's a strong rejection (take the hint, and don't connect again!), whereas if the peer closes the connection later, that's a temporary blip (sorry, got distracted, please connect again).
+
+Here's the grammar for the NULL mechanism:
+
+[[code]]
+null = ready *message
+ready = command-size "READY   " *property
+property = name value
+name = OCTET *name-char
+name-char = ALPHA | DIGIT | "-" | "_" | "." | "+"
+value = 4OCTET *OCTET       ; Size in network byte order
+[[/code]]
+
+Commands always start with a fixed-space 8 character name, and then descend into whatever form of madness makes the command work. For READY, we are sending a metadata dictionary. I decided to go with short text names and long binary values. 2GB should be enough for anyone. This format seems easy to create or parse in any language.
+
+++ The PLAIN Mechanism
+
+I'll explain how ZMTP's security works, because if we're going to use this for real work, we need criticism. I've some ideas for encouraging people to try to break the CURVE mechanism, but that's for later.
+
+Since I've not finished documenting [http://rfc.zeromq.org/spec:25 CURVE], we'll look at [http://rfc.zeromq.org/spec:24 PLAIN]. These two mechanisms [http://rfc.zeromq.org/spec:25 have] [http://rfc.zeromq.org/spec:24 RFCs] already, and you'll see that they use the precise same command grammar:
+
+[[code]]
+C:hello S:welcome C:initiate S:ready *( C:message | S:message )
+[[/code]]
+
+This was deliberate. The handshake is synchronous and consists of two requests from the client and two responses from the server. For PLAIN, we could collapse this to one request and one reply. For CURVE it has to be split up, since the initiate-ready step depends on security already established by hello-welcome. (Note that in CurveCP, which is the original design for the CURVE mechanism, the command is called COOKIE, not WELCOME).
+
+So conceptually, we have three steps:
+
+* Establish security (HELLO, WELCOME).
+* Send meta data (INITIATE, READY).
+* Send messages.
+
+While the first four commands are synchronous, messages are async. That is, the client can start sending messages as soon as it's received READY, and the server can send messages right after it's sent READY. INITIATE and READY carry metadata, like the NULL mechanism's READY command, and using the same dictionary format.
+
+++ The CURVE Mechanism
+
+Roughly, the CURVE mechanism works like PLAIN except that it exchanges encryption keys. CURVE in fact implements CurveZMQ, which is a generic security handshake I'm designing that is taken from CurveCP, a UDP-based security and traffic control protocol designed by cryptographer and mathematician [http://cr.yp.to/djb.html D. J. Bernstein]. CurveCP is based on NaCl, the security library from the same djb.
+
+The security handshake in CurveCP is elegant and relatively simple (compared to other security designs), and comes with a very good pedigree. Whether it really is as robust as djb claims we won't know for a while. However as well as security, CurveCP aims to replace TCP entirely, doing its own traffic control over UDP.
+
+To be honest, I think CurveCP (over UDP) would make a great mechanism in itself for ZMTP but that's a serious challenge. I've tried to keep ZMTP semantically compatible with that idea. In the more pragmatic short term, it turns out that stripping down CurveCP to just the security aspects, assuming TCP is going to be here for some time yet, is feasible.
+
+This is CurveZMQ: the CurveCP handshake taken out and stripped down a little. There's a website, curvezmq.org, but it's still empty. My plan is to take material from curvecp.org, and remix that into a single clean RFC.
+
+It turns out that it's very useful to do end-to-end security on top of 0MQ, as an alternative to doing security in the library. It means you can route over untrusted peers. Imagine I want to make a secure chat application. Two phones, talking to a server in the middle. We don't want the server to ever get clear text data. So the phones do end-to-end security. If we use security in ZMTP, that won't work.
+
+End-to-end security only works with a ROUTER-DEALER combo (or another mix of sockets that can imitate it), since it needs that chatty request-reply handshake. But this is how we build most large-scale services anyhow.
+
+Meaning, at some point I'll write a CurveZMQ mechanism in CZMQ, and show how to use this in a protocol like http://rfc.zeromq.org/spec:19 rfc.zeromq.org/spec:19/FILEMQ or [http://rfc.zeromq.org/spec:20 rfc.zeromq.org/spec:20/ZRE].
+
+++ Pluggable Authentication
+
+A protocol shouldn't have an opinion on implementations except when it affects how they work together. But as ZeroMQ users we should be asking, "how does my application plug into this security model?"
+
+The answer is a little subtle. Clearly as peers come and go, we have to invoke code that authenticates them. ZeroMQ can't do this itself in a realistic way. For instance even the PLAIN mechanism could do a remote username / password lookup to some other server.
+
+Our idea is that libzmq provides an inproc socket for authentication and other events. Presumably this would happen on a per-context basis. You then write your authentication logic as a classic ZeroMQ task: connect to a socket, get the events, process them, and send back OK / NOT-OK replies. Meanwhile the "real" application logic continues to run ignorant of the ongoing authentication. It just gets messages and sends messages like today.
+
+++ Connection Metadata
+
+Adding a dictionary to the security handshake gives us extensible metadata. Right off, this let me move the socket type and identity out of limbo into a safer home. It also provides a place for more information about the connection.
+
+There's really only one reason to put information upfront in the greeting, and that is when we absolutely need it for security negotiation. You'll see one flag ("as-server") that tells the mechanism whether the peer is acting as client or server. It means we don't need to rely on the bind/connect order. But all other metadata sits in this dictionary.
+
+As well as socket type and identity, I defined "resource", which lets us do virtual addressing.
+
+++ Virtual Addressing
+
+One of the missing features in ZMTP was //virtual addresses//. Physical addresses (TCP endpoints) can be costly in some architectures, e.g. when crossing a firewall. If the protocol provides a place for a peer to request a virtual address, during connection negotiation, we can quite easily allow multiple tasks to bind to the same TCP endpoint.
+
+In ZMTP we use the concept of //resource//, because it fits the schema we already use for zmq_bind and zmq_connect endpoints. Here's how a peer makes a resource available by binding to it:
+
+[[code]]
+zmq_bind (publisher, "tcp://*:9001/my/resource/name");
+[[/code]]
+
+Here's how a peer connects to a specific resource on another peer:
+
+[[code]]
+zmq_connect (subscriber, "tcp://192.168.55.23:9001/my/resource/name");
+[[/code]]
+
+The implementation will only create one listening TCP socket, but will keep a list of resources available for that listening socket. When a peer connects, the resource it specifies is then used to route messages to the right task.
+
+In ZMTP the resource name comes after the security handshake, so it's encrypted and tamper-proof when we use secure mechanisms (I'll come to mechanisms in a second). Putting the resource name //after// security does have some implications. It means we cannot use the resource to select credentials. In effect, all connections on a physical endpoint must share the same credentials, e.g. the same server keys.
+
+This isn't really a limitation since TCP in any case does not allow multiple listeners on a port. It's quite plausible to make a mulitiprocess design in which arbitrary processes on a box share a single physical endpoint, by each specifying a different resource. However, there is going to be a single process that does all the zmq_bind commands, acting as proxy for the other processes. And it's sensible that one process has one set of security credentials.
+
+++ Security Considerations
+
+I'll collect possible attacks and strategies to defend against them (if you have more suggestions, let's hear them!) Even attacks we can't defend against are worth documenting. So ZMTP makes some recommendations to implementors:
+
+* Attackers may overwhelm a peer by repeated connection attempts. Thus, a peer MAY log failed accesses, and MAY detect and block repeated failed connections from specific originating IP addresses.
+
+* Attackers may try to cause memory exhaustion in a peer by holding open connections. Thus, a peer MAY allocate memory to a connection only after the security handshake is complete, and MAY limit the number and cost of in-progress handshakes.
+
+* Attackers may try to make small requests that generate large responses back to faked originating addresses (the real target of the attack). This is called an "amplification attack". Thus, peers MAY limit the number of in-progress handshakes per originating IP address.
+
+* Attackers may try to uncover vulnerable versions of an implementation from its metadata. Thus, ZMTP sends metadata //after// security handshaking.
+
+* Attackers can use the size of messages (even without breaking encryption) to collect information about the meaning. Thus, on an encrypted connection, message data SHOULD be padded to a randomized minimum size.
+
+* Attackers can use the simple presence or absence of traffic to collect information about the peer ("Person X has come on line"). Thus, on an encrypted connection, the peer SHOULD send random garbage data ("noise") when there is no other traffic. To fully mask traffic, a peer MAY throttle messages so there is no visible difference between noise and real data.
+
+++ Conclusions
+
+We're still some way off from a secure ZeroMQ, but we're seeing the mountain clearly now. The next step is to make simple reference implementations of the core protocol and each mechanism. Then, we can implement the new protocol in libzmq, with some minimal authentication hooks. One step at a time... 
+
+So what do you think? Have you tried NaCl or libsodium, and did you like it? Are you more of a DTLS guy, and if so, what do you need to start designing your plugin mechanism for ZMTP 3.0? Are you one of those crazy geniuses who has reimplemented ZMTP 2.0 in Java, C#, Erlang, or Bash? How does this new protocol feel to you? Come and discuss on zeromq-dev.

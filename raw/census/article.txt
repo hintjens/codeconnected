@@ -1,0 +1,103 @@
+In the first article on PUB-SUB hacks, we looked at the Meerkat pattern. In this second article I'll walk through a pattern--Census--that's loosely inspired by the "Surveyor" socket type from the defunct Crossroads fork of ZeroMQ. It's a fairly simple pattern. The code for this article is [https://gist.github.com/hintjens/5248234 in a GitHub gist].
+
++++ The Census Pattern
+
+The **Census Pattern** is an evolution of Meerkat that solves the problem of monitoring or querying a set of nodes. The question part looks like a PUB-SUB broadcast and the answer part is similar to a PUSH-PULL sink in that it's a many-to-one flow. You can often simply hard-code the question so it's implied. For instance instead of asking a set of nodes, "who is doing the least work right now?" (to know who to send new work to), nodes could broadcast their availability without being asked.
+
+The advantage of explicitly asking the question is, of course, that you can do more sophisticated group queries. For instance, you could send a search pattern to a set of engines, and get back the first reply or all replies. So Census is like group request-reply, where the replies can be processed according to the use-case.
+
+Traditionally, we'd design Census using a PUB-SUB pattern for the question, and a PUSH-PULL pattern for the replies. In the old days this the advice we gave 0MQ developers: break a complex pattern into separate flows, use a specific socket type for each one.
+
+However it turns out that multiple sets of sockets gets complex and confusing. It's hard to synchronize things when you have multiple independent paths. It's hard to imagine a security model working over mixed socket flows. Using a single socket pair is, it turns out, simpler. And simpler is always better. So that's what we'll aim for: a single socket flow for group request-reply.
+
+Don't confuse "censuses" (if that is a proper word) with "surveys". A census is what you do when you ask your kids, "who wants burgers?" A survey is what you do when you stop random people at the 11th Annual Vegan Life Festival and ask innocently, "who wants burgers?" (The answer might astonish you. Or not. I've never tried, but YouTubing ridiculous surveys conducted on self-selected samples suddenly seems quite fun. Next up, we survey the Papal convention for their opinions on whether burger makes a valid pizza topping, and then we extrapolate their answers to the whole world population.)
+
+Popes aside, here are some ground rules for conducting a census:
+
+* We generally know in advance how many people we're speaking to. People may come and go randomly but unlike a survey, our goal is to count the heads we can see, not the ones we can't.
+
+* We expect either an answer, or silence, within a certain time. On a computer network as in the real world, there's no such thing as perfection.
+
+* Based on the results, we take some decision, which may be to repeat the question, ask a different question, to jump to a bogus forgone conclusion, etc.
+
+So parameters for a census are: the question we ask, the allowed answers, the time we allow for answers, and the total size of our target population. That last piece is, of course, where Meerkat comes in since it lets us conduct a census of a dynamic population that may be leaving and joining the network randomly.
+
+++++ Census Over XPUB-XSUB
+
+Clearly the PUB-SUB pattern is a good place to start with a census since we want to broadcast the question to everyone. We do have to use XPUB and XSUB since they give us extra superpowers we need. Two superpowers, in fact:
+
+* We can send and receive subscription messages, which lets us do the Meerkat part.
+
+* XSUB sockets can talk back to XPUB sockets, which lets us do the Census part.
+
+John Muehlhausen's {{libzmq}} [https://github.com/zeromq/libzmq/commit/d32e3922785f170ce24159ab5e4b44badc473ec1 d32e39 commit] from 7 January 2013 is worth studying. If I taught computer science, I'd spend a few hours just boring my poor students with this one. His 14-line patch hacked XPUB and XSUB into becoming a two-way highway for messages. It's so simple and so very beautiful. I like the evolution of PUB and SUB from a one-way purist design (from the original one-way PGM-style financial data distribution) into more tactile and pragmatic two-way sockets.
+
+The patch is a minimal change, evolution in action. A subscription message starts with 0x01. An unsubscription message starts with 0x00. We discard any other message, right? That's how XPUB and XSUB were //designed//. But hang on, no, hang on... Let's not throw other messages away, let's pass them on up instead. Suddenly the gate opens to subscribers sending stuff back to their publishers.
+
+So, literally (and I mean this in the non-figurative sense), you can send a "normal" message to an XSUB socket, and you can receive "normal" messages off XPUB sockets. XPUB works like a sink, and will fair-queue incoming messages from its subscribers, while XSUB works like a copier, and will copy the message to each XPUB it's connected to. You don't need any special socket options for this, it's how the sockets work out of the box. If you don't want the functionality, just discard "normal" messages in code that reads from XPUB sockets[figure].
+
+[[code type="textdiagram" title="The Census Pattern"]]
+                #-------------#
+                |   Counter   |
+                +-------------+
+                |    XPUB     |
+                '-------------'
+                     recv
+                       ^
+                       |
+      .----------------+----------------.
+      |                |                |
+   "Yes"              "No"          (silence)
+.----------.     .----------.      .----------.
+|   XSUB   |     |   XSUB   |      |   XSUB   |
++----------+     +----------+      +----------+
+|  Target  |     |  Target  |      |  Target  |
+#----------#     #----------#      #----------#
+[[/code]]
+
+Enough ado already, let's take this pie out of the oven and see how it tastes. Here's my first attempt at the Census pattern:
+
+[[code type="example" title="Census Pattern over XSUB-XPUB" name="census1"]]
+[[/code]]
+
+It's not huge, 150 lines of code in C. The counter task has two steps. If all nodes are up and running, the whole thing runs with no delay. If there's a node broken or too busy to answer, each step will wait for a while before timing out. A census will still be valid if there are missing nodes. In a realistic implementation we could continue to ask more questions, and not need to wait for nodes to join again each time.
+
+++++ Census Over ROUTER-DEALER
+
+In the Big Black Book of Mad Science (originally it was a kind of light green but multiple incendiary near-misses gave it a charred exterior, and the general consensus was that "The Big Kind of Light Green Book" didn't have quite the same ring anyhow), rule number three is: "If at first you succeed, try again with more gunpowder". (Rules one and two are, since you're asking, "Bald is the new Evil", and "If you laugh loudly, you can get away with almost anything". Protective eye-wear only merits rule number 24. Rule number five says, enigmatically, "If you have to ask what rule #5 is, you can't afford it.")
+
+So, more gunpowder! XPUB-XSUB is neat, but how about ROUTER-DEALER? After all, the Census pattern requires a two-way many-to-one dialog, and ROUTER-DEALER are pretty good at that. As an experiment, let's rewrite the same Census example using ROUTER-DEALER, and see whether it's simpler or more complex[figure].
+
+[[code type="textdiagram" title="Census with More Gunpowder"]]
+                #-------------#
+                |   Counter   |
+                +-------------+
+                |   ROUTER    |
+                '-------------'
+                     recv
+                       ^
+                       |
+      .----------------+----------------.
+      |                |                |
+   "Yes"              "No"          (silence)
+.----------.     .----------.      .----------.
+|  DEALER  |     |  DEALER  |      |  DEALER  |
++----------+     +----------+      +----------+
+|  Target  |     |  Target  |      |  Target  |
+#----------#     #----------#      #----------#
+[[/code]]
+
+Here's the code:
+
+[[code type="example" title="Census Pattern over ROUTER-DEALER" name="census2"]]
+[[/code]]
+
+Quite shockingly, this worked first time and is only two-thirds the size of the XPUB-XSUB version. The code is quite a lot simpler. This teaches us a few things:
+
+* ROUTER-DEALER is a powerful tool.
+
+* Asynchronous beats synchronous. The main cost in the XPUB-XSUB model is the getting everyone to pay attention and listen to the question at the same time. This doubles the size of the publisher task and doubles the worst-case time for the census.
+
+* Always try again, with more gunpowder.
+
+The next and final article in this little series of PUB-SUB Hacks will cover the Repeater pattern, which is an "any-to-all pub-sub for Very Large Networks" pattern.
